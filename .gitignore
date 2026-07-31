@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local application state and logs
+spine_candidate_picker_state.json
+*.log
+
+# Generated builder output
+Spine_Built*/
+_candidates/
+_materialized_history/
+
+# Game/source assets are intentionally not versioned
+*.atlas
+*.skel
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.ktx
+*.ktx2
+*.astc
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Documentation images may be committed intentionally
+!docs/**/*.png
+!docs/**/*.jpg
+!docs/**/*.jpeg
+!docs/**/*.webp
