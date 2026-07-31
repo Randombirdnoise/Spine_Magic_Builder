@@ -1,8 +1,10 @@
 # Spine Magic Builder
 
-Spine Magic Builder is a Windows-first reconstruction toolkit for scattered or poorly named Spine assets. It scans a directory tree at byte level, identifies skeletons and atlases, matches texture pages, writes normalized Spine sets, and provides a visual candidate workflow for ambiguous matches.
+[English](README.md) · [中文（简体）](README.zh-CN.md)
 
-The project is designed for extracted asset trees where filenames and extensions cannot be trusted. It supports JSON and binary skeleton discovery, embedded or standalone atlas data, PNG/JPEG/WebP texture dimensions, multi-page atlases, and optional same-dimension candidate staging.
+Spine Magic Builder is a Windows-first reconstruction toolkit for scattered or poorly named Spine assets. It scans a directory tree at byte level, identifies skeletons and atlases, matches texture [...]
+
+The project is designed for extracted asset trees where filenames and extensions cannot be trusted. It supports JSON and binary skeleton discovery, embedded or standalone atlas data, PNG/JPEG/WebP [...]
 
 > Use this tool only with assets you own or are authorized to inspect. No game assets, Spine runtimes, or viewer binaries are included.
 
@@ -84,7 +86,7 @@ Run_SpineMagic_Builder.bat "D:\ExtractedGame\assets"
 
 ### Candidate-stage builder
 
-`Run_SpineMagic_Builder_Candidate_Stage_v3.bat` isolates immediate child folders as entities, ranks ambiguous same-dimension textures, and stages all candidates. It requests symlinks to avoid duplicating large texture collections; on systems where symlinks are unavailable, the script tries a hardlink and finally falls back to copying.
+`Run_SpineMagic_Builder_Candidate_Stage_v3.bat` isolates immediate child folders as entities, ranks ambiguous same-dimension textures, and stages all candidates. It requests symlinks to avoid dupl[...]
 
 Use `--stage-dim-candidates-limit N` directly from Python when unlimited staging would produce too many candidates.
 
@@ -109,7 +111,7 @@ Useful keys:
 | `S` | Skip current page |
 | `F5` | Launch SpineViewer |
 
-Use the **Viewer exe** button if SpineViewer is not found automatically. The automatic search checks the repository folder, a `SpineViewer` subfolder, and the repository's parent folder. SpineViewer remains a separate download.
+Use the **Viewer exe** button if SpineViewer is not found automatically. The automatic search checks the repository folder, a `SpineViewer` subfolder, and the repository's parent folder. SpineVie[...]
 
 ## Command-line usage
 
@@ -139,7 +141,7 @@ py -3 spine_magic_builder_candidate_materializer_v3.py `
   --link-mode copy
 ```
 
-Run either builder with `--help` for the complete option list. Useful advanced switches include `--explain-match`, `--top-n`, `--entity-mode`, `--rewrite-pages-to-match-source`, and `--dedupe-textures`.
+Run either builder with `--help` for the complete option list. Useful advanced switches include `--explain-match`, `--top-n`, `--entity-mode`, `--rewrite-pages-to-match-source`, and `--dedupe-tex[...]
 
 ## Safety notes
 
@@ -169,7 +171,7 @@ Download a release from the upstream [SpineViewer repository](https://github.com
 
 ## Acknowledgements
 
-A very special thank-you to [ww-rm/SpineViewer](https://github.com/ww-rm/SpineViewer) and its contributors. SpineViewer is the external visual-validation component used by the GUI workflow and makes rapid candidate checking possible.
+A very special thank-you to [ww-rm/SpineViewer](https://github.com/ww-rm/SpineViewer) and its contributors. SpineViewer is the external visual-validation component used by the GUI workflow and ma[...]
 
 SpineViewer is not bundled with or relicensed by this project. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.
 
