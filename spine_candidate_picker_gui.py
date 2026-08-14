@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -17,6 +18,7 @@ from tkinter import ttk
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MATERIALIZER = SCRIPT_DIR / "spine_magic_builder_candidate_materializer_v3.py"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+FINALIZE_MODES = ("move", "copy", "hardlink", "symlink")
 
 
 def default_viewer_path() -> Path:
@@ -209,11 +211,98 @@ def set_key(spine_set: SpineSet, page: PageCandidates) -> str:
     return f"{spine_set.folder.resolve()}|page{page.page_index:02d}|{page.atlas_page}"
 
 
+def path_key(path: Path | str) -> str:
+    try:
+        return str(Path(path).expanduser().resolve()).lower()
+    except OSError:
+        return str(path).strip().lower()
+
+
+def candidate_identity(candidate: Candidate) -> str:
+    raw = (candidate.source_path or "").strip().strip('"')
+    if raw:
+        source = Path(raw)
+        if source.is_absolute() or source.exists():
+            return path_key(source)
+    return path_key(candidate.file_path)
+
+
+def state_entry_identities(entry: dict) -> set[str]:
+    identities = set()
+    for key in ("source_path", "candidate_file"):
+        raw = str(entry.get(key) or "").strip().strip('"')
+        if raw:
+            identities.add(path_key(raw))
+    return identities
+
+
+def remove_existing(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def relpath(src: Path, dst_parent: Path) -> str:
+    try:
+        return os.path.relpath(str(src), start=str(dst_parent))
+    except OSError:
+        return str(src)
+
+
+def same_file(left: Path, right: Path) -> bool:
+    try:
+        return left.samefile(right)
+    except OSError:
+        return path_key(left) == path_key(right)
+
+
+def place_final_texture(src: Path, target: Path, mode: str) -> str:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if mode not in FINALIZE_MODES:
+        raise ValueError(f"Unknown finalize mode: {mode}")
+
+    if not src.exists() and not src.is_symlink():
+        raise FileNotFoundError(f"Missing selected candidate: {src}")
+
+    tmp = target.with_name(f".{target.name}.finalize_tmp")
+    remove_existing(tmp)
+
+    if mode == "move":
+        if target.exists() and same_file(src, target) and not target.is_symlink() and not src.is_symlink():
+            return "already local"
+        if src.is_symlink():
+            resolved = src.resolve(strict=True)
+            shutil.copy2(resolved, tmp)
+            os.replace(tmp, target)
+            try:
+                src.unlink()
+            except OSError:
+                pass
+            return "move (dereferenced symlink)"
+        shutil.move(str(src), str(tmp))
+        os.replace(tmp, target)
+        return "move"
+
+    resolved_src = src.resolve(strict=True) if src.is_symlink() else src
+    if mode == "copy":
+        if target.exists() and same_file(resolved_src, target) and not target.is_symlink():
+            return "already local"
+        shutil.copy2(resolved_src, tmp)
+    elif mode == "hardlink":
+        os.link(resolved_src, tmp)
+    elif mode == "symlink":
+        os.symlink(relpath(resolved_src, target.parent), tmp)
+
+    os.replace(tmp, target)
+    return mode
+
+
 class CandidatePickerApp:
     def __init__(self, root: tk.Tk, start_path: Path | None = None):
         self.root = root
         self.root.title("Spine Candidate Picker")
-        self.root.geometry("1280x760")
+        self.root.geometry("1280x860")
         self.state = load_state()
         self.spine_sets: list[SpineSet] = []
         self.current_set_index = 0
@@ -223,6 +312,17 @@ class CandidatePickerApp:
         self.materializer = Path(self.state.get("settings", {}).get("materializer") or DEFAULT_MATERIALIZER)
         self.viewer = Path(self.state.get("settings", {}).get("viewer") or DEFAULT_VIEWER)
         self.link_mode = tk.StringVar(value=self.state.get("settings", {}).get("link_mode", "symlink"))
+        finalize_mode = self.state.get("settings", {}).get("finalize_mode", "move")
+        if finalize_mode not in FINALIZE_MODES:
+            finalize_mode = "move"
+        self.finalize_mode = tk.StringVar(value=finalize_mode)
+        self.delete_candidates_after_finalize = tk.BooleanVar(value=self.state.get("settings", {}).get("delete_candidates_after_finalize", True))
+        self.hide_blacklisted = tk.BooleanVar(value=self.state.get("settings", {}).get("hide_blacklisted", True))
+        try:
+            preview_height = int(self.state.get("settings", {}).get("preview_height", 320))
+        except (TypeError, ValueError):
+            preview_height = 320
+        self.preview_height = tk.IntVar(value=preview_height)
         self.stage_limit = tk.StringVar(value=str(self.state.get("settings", {}).get("stage_limit", 150)))
         self.auto_viewer = tk.BooleanVar(value=self.state.get("settings", {}).get("auto_viewer", True))
         self.restart_viewer = tk.BooleanVar(value=self.state.get("settings", {}).get("restart_viewer", True))
@@ -263,6 +363,21 @@ class CandidatePickerApp:
         ttk.Button(opts, text="Viewer exe", command=self.pick_viewer).pack(side=tk.LEFT, padx=2)
         ttk.Button(opts, text="Materializer", command=self.pick_materializer).pack(side=tk.LEFT, padx=2)
         ttk.Button(opts, text="Open Set Folder", command=self.open_current_folder).pack(side=tk.RIGHT)
+
+        final_opts = ttk.Frame(self.root, padding=(8, 0, 8, 6))
+        final_opts.pack(fill=tk.X)
+        ttk.Label(final_opts, text="Finalize mode").pack(side=tk.LEFT)
+        finalize_combo = ttk.Combobox(final_opts, textvariable=self.finalize_mode, values=FINALIZE_MODES, width=9, state="readonly")
+        finalize_combo.pack(side=tk.LEFT, padx=6)
+        finalize_combo.bind("<<ComboboxSelected>>", lambda _e: self.save_settings())
+        ttk.Checkbutton(final_opts, text="Delete _candidates", variable=self.delete_candidates_after_finalize, command=self.save_settings).pack(side=tk.LEFT, padx=8)
+        ttk.Checkbutton(final_opts, text="Hide blacklisted", variable=self.hide_blacklisted, command=self.on_blacklist_filter_change).pack(side=tk.LEFT, padx=8)
+        ttk.Label(final_opts, text="Preview px").pack(side=tk.LEFT, padx=(14, 2))
+        preview_spin = tk.Spinbox(final_opts, from_=120, to=1000, increment=20, textvariable=self.preview_height, width=5, command=self.apply_preview_height)
+        preview_spin.pack(side=tk.LEFT)
+        preview_spin.bind("<FocusOut>", lambda _e: self.apply_preview_height())
+        preview_spin.bind("<Return>", lambda _e: self.apply_preview_height())
+        ttk.Button(final_opts, text="Finalize Set", command=self.finalize_current_set).pack(side=tk.RIGHT, padx=2)
 
         main = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         main.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
@@ -319,7 +434,7 @@ class CandidatePickerApp:
         preview_frame = ttk.Frame(detail_pane)
         detail_pane.add(preview_frame, weight=2)
         ttk.Label(preview_frame, text="Thumbnail").pack(anchor=tk.W)
-        self.thumbnail_canvas = tk.Canvas(preview_frame, height=220, bg="#242424", highlightthickness=1, highlightbackground="#555555")
+        self.thumbnail_canvas = tk.Canvas(preview_frame, height=self.normalized_preview_height(), bg="#242424", highlightthickness=1, highlightbackground="#555555")
         self.thumbnail_canvas.pack(fill=tk.BOTH, expand=True)
         self.thumbnail_canvas.bind("<Configure>", lambda _e: self.update_thumbnail())
         ttk.Label(preview_frame, text="Preview Metadata").pack(anchor=tk.W, pady=(8, 0))
@@ -368,6 +483,10 @@ class CandidatePickerApp:
                 "materializer": str(self.materializer),
                 "viewer": str(self.viewer),
                 "link_mode": self.link_mode.get(),
+                "finalize_mode": self.finalize_mode.get(),
+                "delete_candidates_after_finalize": bool(self.delete_candidates_after_finalize.get()),
+                "hide_blacklisted": bool(self.hide_blacklisted.get()),
+                "preview_height": self.normalized_preview_height(),
                 "stage_limit": self.normalized_stage_limit(),
                 "auto_viewer": bool(self.auto_viewer.get()),
                 "restart_viewer": bool(self.restart_viewer.get()),
@@ -385,6 +504,27 @@ class CandidatePickerApp:
             value = 0
         self.stage_limit.set(str(value))
         return value
+
+    def normalized_preview_height(self) -> int:
+        try:
+            value = int(self.preview_height.get())
+        except (tk.TclError, ValueError):
+            value = 320
+        value = max(120, min(value, 1000))
+        self.preview_height.set(value)
+        return value
+
+    def apply_preview_height(self):
+        value = self.normalized_preview_height()
+        if hasattr(self, "thumbnail_canvas"):
+            self.thumbnail_canvas.configure(height=value)
+            self.update_thumbnail()
+        self.save_settings()
+
+    def on_blacklist_filter_change(self):
+        self.save_settings()
+        self.refresh_candidates()
+        self.select_candidate_by_index(0)
 
     def browse_folder(self):
         folder = filedialog.askdirectory(title="Select built Spine folder or scan root")
@@ -546,25 +686,56 @@ class CandidatePickerApp:
             return None
         return s, s.pages[self.current_page_index]
 
+    def identity_marked_correct(self, identity: str) -> bool:
+        for entry in self.state.get("correct", {}).values():
+            if identity in state_entry_identities(entry):
+                return True
+        return False
+
+    def is_candidate_blacklisted(self, s: SpineSet, p: PageCandidates, c: Candidate) -> bool:
+        page_black = self.state.get("blacklist", {}).get(set_key(s, p), {})
+        if str(c.rank) in page_black:
+            return True
+        identity = candidate_identity(c)
+        return identity in self.state.get("blacklist_global", {})
+
+    def visible_candidates(self, pair: tuple[SpineSet, PageCandidates]) -> list[Candidate]:
+        s, p = pair
+        if not self.hide_blacklisted.get():
+            return list(p.candidates)
+        return [c for c in p.candidates if not self.is_candidate_blacklisted(s, p, c)]
+
     def refresh_candidates(self):
         self.cand_tree.delete(*self.cand_tree.get_children())
         pair = self.current_set_page()
         if not pair:
             return
         s, p = pair
-        black = self.state.get("blacklist", {}).get(set_key(s, p), {})
+        visible_ranks = set()
+        hidden_count = 0
         for c in p.candidates:
-            tags = ("blacklisted",) if str(c.rank) in black else ()
+            blacklisted = self.is_candidate_blacklisted(s, p, c)
+            if blacklisted and self.hide_blacklisted.get():
+                hidden_count += 1
+                continue
+            tags = ("blacklisted",) if blacklisted else ()
             self.cand_tree.insert("", tk.END, iid=str(c.rank), values=(c.rank, c.score if c.score is not None else "", c.file_path.name, c.source_path, c.note), tags=tags)
+            visible_ranks.add(c.rank)
         self.cand_tree.tag_configure("blacklisted", foreground="#888888")
+        if self.current_candidate_rank not in visible_ranks:
+            self.current_candidate_rank = None
+        if hidden_count:
+            self.status.set(f"[filter] hid {hidden_count} blacklisted candidate(s) on page {p.page_index}")
         self.update_preview()
 
     def select_candidate_by_index(self, idx: int):
         pair = self.current_set_page()
         if not pair:
             return
-        candidates = pair[1].candidates
+        candidates = self.visible_candidates(pair)
         if not candidates:
+            self.current_candidate_rank = None
+            self.update_preview()
             return
         idx = max(0, min(idx, len(candidates) - 1))
         rank = candidates[idx].rank
@@ -756,7 +927,7 @@ class CandidatePickerApp:
         pair = self.current_set_page()
         if not pair:
             return
-        ranks = [c.rank for c in pair[1].candidates]
+        ranks = [c.rank for c in self.visible_candidates(pair)]
         if not ranks:
             return
         rank = self.current_candidate_rank or ranks[0]
@@ -767,7 +938,7 @@ class CandidatePickerApp:
         pair = self.current_set_page()
         if not pair:
             return
-        ranks = [c.rank for c in pair[1].candidates]
+        ranks = [c.rank for c in self.visible_candidates(pair)]
         if not ranks:
             return
         rank = self.current_candidate_rank or ranks[0]
@@ -793,8 +964,11 @@ class CandidatePickerApp:
             "candidate_file": str(c.file_path),
             "source_path": c.source_path,
         }
+        self.state.get("blacklist", {}).get(key, {}).pop(str(c.rank), None)
+        self.state.get("blacklist_global", {}).pop(candidate_identity(c), None)
         save_state(self.state)
         self.refresh_pages()
+        self.refresh_candidates()
         self.log_line(f"[OK] marked correct: page {p.page_index} rank {c.rank}")
 
     def blacklist_candidate(self):
@@ -810,9 +984,20 @@ class CandidatePickerApp:
             "source_path": c.source_path,
             "reason": reason,
         }
+        identity = candidate_identity(c)
+        global_note = "local only; already marked correct elsewhere"
+        if not self.identity_marked_correct(identity):
+            self.state.setdefault("blacklist_global", {})[identity] = {
+                "candidate_file": str(c.file_path),
+                "source_path": c.source_path,
+                "reason": reason,
+                "first_seen": key,
+            }
+            global_note = "global"
         save_state(self.state)
         self.refresh_candidates()
-        self.log_line(f"[MISS] blacklisted: page {p.page_index} rank {c.rank}")
+        self.select_candidate_by_index(0)
+        self.log_line(f"[MISS] blacklisted: page {p.page_index} rank {c.rank} ({global_note})")
 
     def skip_page(self):
         pair = self.current_set_page()
@@ -824,6 +1009,128 @@ class CandidatePickerApp:
         self.refresh_pages()
         self.next_page()
         self.log_line(f"[skip] page {p.page_index}: {p.atlas_page}")
+
+    def current_materialized_rank(self, s: SpineSet, page_index: int) -> int | None:
+        note = s.folder / "_materialized_history" / f"page{page_index:02d}_current.txt"
+        text = read_text(note)
+        for line in text.splitlines():
+            if line.startswith("candidate_rank:"):
+                try:
+                    return int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    return None
+        return None
+
+    def find_candidate_by_rank(self, page: PageCandidates, rank: int) -> Candidate | None:
+        for candidate in page.candidates:
+            if candidate.rank == rank:
+                return candidate
+        return None
+
+    def finalize_choices(self, s: SpineSet) -> tuple[list[tuple[PageCandidates, Candidate, str]], list[PageCandidates]]:
+        choices = []
+        missing = []
+        correct_state = self.state.get("correct", {})
+        for page in s.pages:
+            key = set_key(s, page)
+            rank = None
+            source = ""
+            if key in correct_state:
+                try:
+                    rank = int(correct_state[key].get("rank"))
+                    source = "marked correct"
+                except (TypeError, ValueError):
+                    rank = None
+            if rank is None:
+                rank = self.current_materialized_rank(s, page.page_index)
+                source = "activated"
+            candidate = self.find_candidate_by_rank(page, rank) if rank is not None else None
+            if candidate:
+                choices.append((page, candidate, source))
+            elif key not in self.state.get("skipped", {}):
+                missing.append(page)
+        return choices, missing
+
+    def finalize_current_set(self):
+        if not self.spine_sets:
+            return
+        s = self.spine_sets[self.current_set_index]
+        mode = self.finalize_mode.get()
+        if mode not in FINALIZE_MODES:
+            mode = "move"
+            self.finalize_mode.set(mode)
+        self.save_settings()
+
+        choices, missing = self.finalize_choices(s)
+        if not choices:
+            messagebox.showerror("Nothing to finalize", "No marked-correct or activated candidate choices were found for this set.")
+            return
+        if missing:
+            sample = "\n".join(f"page {p.page_index}: {p.atlas_page}" for p in missing[:8])
+            if len(missing) > 8:
+                sample += f"\n...and {len(missing) - 8} more"
+            if not messagebox.askyesno(
+                "Finalize incomplete set?",
+                f"{len(missing)} page(s) have no selected candidate:\n\n{sample}\n\nFinalize the selected pages anyway?",
+                parent=self.root,
+            ):
+                return
+        if mode == "symlink" and self.delete_candidates_after_finalize.get():
+            if not messagebox.askyesno(
+                "Finalize with symlinks?",
+                "Symlink finalize can still depend on source images outside this folder. Continue with symlink mode?",
+                parent=self.root,
+            ):
+                return
+
+        threading.Thread(
+            target=self._run_finalize_thread,
+            args=(s, choices, mode, bool(self.delete_candidates_after_finalize.get())),
+            daemon=True,
+        ).start()
+
+    def _run_finalize_thread(self, s: SpineSet, choices: list[tuple[PageCandidates, Candidate, str]], mode: str, delete_candidates: bool):
+        try:
+            if not s.atlas:
+                raise RuntimeError(f"No atlas found in {s.folder}")
+            atlas_pages = parse_atlas_pages(s.atlas)
+            if not atlas_pages:
+                raise RuntimeError(f"Could not parse atlas pages from {s.atlas}")
+
+            finalized = 0
+            remaining_by_identity: dict[str, int] = {}
+            for _page, candidate, _source in choices:
+                identity = candidate_identity(candidate)
+                remaining_by_identity[identity] = remaining_by_identity.get(identity, 0) + 1
+            self.root.after(0, self.log_line, f"[finalize] {s.folder}")
+            for page, candidate, source in choices:
+                if page.page_index < 1 or page.page_index > len(atlas_pages):
+                    raise IndexError(f"Page {page.page_index} is out of range for {s.atlas.name}")
+                target_name = Path(atlas_pages[page.page_index - 1]["name"]).name
+                if not target_name:
+                    raise RuntimeError(f"Atlas page {page.page_index} has no usable filename")
+                target = s.folder / target_name
+                identity = candidate_identity(candidate)
+                place_mode = "copy" if mode == "move" and remaining_by_identity.get(identity, 0) > 1 else mode
+                placed = place_final_texture(candidate.file_path, target, place_mode)
+                remaining_by_identity[identity] = remaining_by_identity.get(identity, 1) - 1
+                finalized += 1
+                self.root.after(
+                    0,
+                    self.log_line,
+                    f"[OK] finalized page {page.page_index} rank {candidate.rank} -> {target.name} via {placed} ({source})",
+                )
+
+            if delete_candidates:
+                cand_root = s.folder / "_candidates"
+                if cand_root.exists():
+                    shutil.rmtree(cand_root)
+                    self.root.after(0, self.log_line, f"[OK] deleted {cand_root}")
+
+            self.root.after(0, self.log_line, f"[OK] finalize complete: {finalized} page(s)")
+            self.root.after(0, self.scan_root, s.folder)
+        except Exception as exc:
+            self.root.after(0, self.log_line, f"[ERR] finalize failed: {exc}")
 
     def open_current_folder(self):
         pair = self.current_set_page()
