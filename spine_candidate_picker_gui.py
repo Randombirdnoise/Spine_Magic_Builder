@@ -227,12 +227,41 @@ def candidate_identity(candidate: Candidate) -> str:
     return path_key(candidate.file_path)
 
 
+def _candidate_name_aliases(raw: str) -> set[str]:
+    name = Path(str(raw).strip().strip('"')).name.lower()
+    if not name:
+        return set()
+    # Staged files are named like 0001_score123_original_00001.png.
+    clean_name = re.sub(r"^\d{4}_score-?\d+_", "", name)
+    stem = Path(clean_name).stem
+    aliases = {f"name:{clean_name}", f"stem:{stem}"}
+    m = re.search(r"(?:^|[_\-.])(\d{5,})$", stem)
+    if m:
+        aliases.add(f"suffix:{m.group(1)}")
+    return aliases
+
+
+def candidate_aliases(candidate: Candidate) -> set[str]:
+    aliases = {candidate_identity(candidate), path_key(candidate.file_path)}
+    raw_source = (candidate.source_path or "").strip().strip('"')
+    if raw_source:
+        aliases.add(path_key(raw_source))
+        aliases.update(_candidate_name_aliases(raw_source))
+    aliases.update(_candidate_name_aliases(str(candidate.file_path)))
+    return {alias for alias in aliases if alias}
+
+
 def state_entry_identities(entry: dict) -> set[str]:
     identities = set()
+    for alias in entry.get("aliases", []) or []:
+        raw = str(alias).strip()
+        if raw:
+            identities.add(raw)
     for key in ("source_path", "candidate_file"):
         raw = str(entry.get(key) or "").strip().strip('"')
         if raw:
             identities.add(path_key(raw))
+            identities.update(_candidate_name_aliases(raw))
     return identities
 
 
@@ -377,6 +406,7 @@ class CandidatePickerApp:
         preview_spin.pack(side=tk.LEFT)
         preview_spin.bind("<FocusOut>", lambda _e: self.apply_preview_height())
         preview_spin.bind("<Return>", lambda _e: self.apply_preview_height())
+        ttk.Button(final_opts, text="Finalize All", command=self.finalize_all_sets).pack(side=tk.RIGHT, padx=2)
         ttk.Button(final_opts, text="Finalize Set", command=self.finalize_current_set).pack(side=tk.RIGHT, padx=2)
 
         main = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
@@ -655,7 +685,9 @@ class CandidatePickerApp:
                 cached = f"OK {self.state['correct'][key].get('rank')}"
             elif key in self.state.get("skipped", {}):
                 cached = "skip"
-            self.page_tree.insert("", tk.END, iid=str(idx), values=(f"{p.page_index}: {p.atlas_page}", p.requested_size, len(p.candidates), cached))
+            visible_count = len(self.visible_candidates((s, p))) if self.hide_blacklisted.get() else len(p.candidates)
+            count = visible_count if visible_count == len(p.candidates) else f"{visible_count}/{len(p.candidates)}"
+            self.page_tree.insert("", tk.END, iid=str(idx), values=(f"{p.page_index}: {p.atlas_page}", p.requested_size, count, cached))
 
     def select_page(self, idx: int):
         if not self.spine_sets:
@@ -686,18 +718,33 @@ class CandidatePickerApp:
             return None
         return s, s.pages[self.current_page_index]
 
-    def identity_marked_correct(self, identity: str) -> bool:
+    def candidate_marked_correct(self, candidate: Candidate) -> bool:
+        aliases = candidate_aliases(candidate)
         for entry in self.state.get("correct", {}).values():
-            if identity in state_entry_identities(entry):
+            if aliases & state_entry_identities(entry):
+                return True
+        return False
+
+    def candidate_used_elsewhere(self, key: str, candidate: Candidate) -> bool:
+        aliases = candidate_aliases(candidate)
+        for correct_key, entry in self.state.get("correct", {}).items():
+            if correct_key != key and aliases & state_entry_identities(entry):
+                return True
+        for entry in self.state.get("used_global", {}).values():
+            owner = str(entry.get("set_key") or "")
+            if owner != key and aliases & state_entry_identities(entry):
                 return True
         return False
 
     def is_candidate_blacklisted(self, s: SpineSet, p: PageCandidates, c: Candidate) -> bool:
-        page_black = self.state.get("blacklist", {}).get(set_key(s, p), {})
+        key = set_key(s, p)
+        page_black = self.state.get("blacklist", {}).get(key, {})
         if str(c.rank) in page_black:
             return True
-        identity = candidate_identity(c)
-        return identity in self.state.get("blacklist_global", {})
+        aliases = candidate_aliases(c)
+        if any(alias in self.state.get("blacklist_global", {}) for alias in aliases):
+            return True
+        return self.candidate_used_elsewhere(key, c)
 
     def visible_candidates(self, pair: tuple[SpineSet, PageCandidates]) -> list[Candidate]:
         s, p = pair
@@ -958,14 +1005,18 @@ class CandidatePickerApp:
             return
         s, p = pair
         key = set_key(s, p)
+        aliases = sorted(candidate_aliases(c))
         self.state.setdefault("correct", {})[key] = {
             "rank": c.rank,
             "score": c.score,
             "candidate_file": str(c.file_path),
             "source_path": c.source_path,
+            "aliases": aliases,
         }
         self.state.get("blacklist", {}).get(key, {}).pop(str(c.rank), None)
-        self.state.get("blacklist_global", {}).pop(candidate_identity(c), None)
+        for alias in aliases:
+            self.state.get("blacklist_global", {}).pop(alias, None)
+        self.remember_used_candidate(key, p, c, "marked correct")
         save_state(self.state)
         self.refresh_pages()
         self.refresh_candidates()
@@ -982,19 +1033,24 @@ class CandidatePickerApp:
         self.state.setdefault("blacklist", {}).setdefault(key, {})[str(c.rank)] = {
             "candidate_file": str(c.file_path),
             "source_path": c.source_path,
+            "aliases": sorted(candidate_aliases(c)),
             "reason": reason,
         }
-        identity = candidate_identity(c)
+        aliases = sorted(candidate_aliases(c))
         global_note = "local only; already marked correct elsewhere"
-        if not self.identity_marked_correct(identity):
-            self.state.setdefault("blacklist_global", {})[identity] = {
+        if not self.candidate_marked_correct(c):
+            entry = {
                 "candidate_file": str(c.file_path),
                 "source_path": c.source_path,
+                "aliases": aliases,
                 "reason": reason,
                 "first_seen": key,
             }
+            for alias in aliases:
+                self.state.setdefault("blacklist_global", {})[alias] = entry
             global_note = "global"
         save_state(self.state)
+        self.refresh_pages()
         self.refresh_candidates()
         self.select_candidate_by_index(0)
         self.log_line(f"[MISS] blacklisted: page {p.page_index} rank {c.rank} ({global_note})")
@@ -1051,15 +1107,53 @@ class CandidatePickerApp:
                 missing.append(page)
         return choices, missing
 
-    def finalize_current_set(self):
-        if not self.spine_sets:
-            return
-        s = self.spine_sets[self.current_set_index]
+    def remember_used_candidate(self, key: str, page: PageCandidates, candidate: Candidate, source: str) -> None:
+        aliases = sorted(candidate_aliases(candidate))
+        entry = {
+            "set_key": key,
+            "page_index": page.page_index,
+            "atlas_page": page.atlas_page,
+            "rank": candidate.rank,
+            "score": candidate.score,
+            "candidate_file": str(candidate.file_path),
+            "source_path": candidate.source_path,
+            "aliases": aliases,
+            "source": source,
+        }
+        used = self.state.setdefault("used_global", {})
+        for alias in aliases:
+            used[alias] = entry
+
+    def normalized_finalize_mode(self) -> str:
         mode = self.finalize_mode.get()
         if mode not in FINALIZE_MODES:
             mode = "move"
             self.finalize_mode.set(mode)
         self.save_settings()
+        return mode
+
+    def confirm_symlink_finalize_if_needed(self, mode: str) -> bool:
+        if mode == "symlink" and self.delete_candidates_after_finalize.get():
+            return messagebox.askyesno(
+                "Finalize with symlinks?",
+                "Symlink finalize can still depend on source images outside this folder. Continue with symlink mode?",
+                parent=self.root,
+            )
+        return True
+
+    def current_scan_path(self, fallback: Path) -> Path:
+        raw = self.path_var.get().strip().strip('"')
+        if raw:
+            path = Path(raw).expanduser()
+            if path.exists():
+                return path.parent if path.is_file() else path
+        return fallback
+
+    def finalize_current_set(self):
+        if not self.spine_sets:
+            return
+        s = self.spine_sets[self.current_set_index]
+        mode = self.normalized_finalize_mode()
 
         choices, missing = self.finalize_choices(s)
         if not choices:
@@ -1075,60 +1169,110 @@ class CandidatePickerApp:
                 parent=self.root,
             ):
                 return
-        if mode == "symlink" and self.delete_candidates_after_finalize.get():
-            if not messagebox.askyesno(
-                "Finalize with symlinks?",
-                "Symlink finalize can still depend on source images outside this folder. Continue with symlink mode?",
-                parent=self.root,
-            ):
-                return
+        if not self.confirm_symlink_finalize_if_needed(mode):
+            return
 
         threading.Thread(
-            target=self._run_finalize_thread,
-            args=(s, choices, mode, bool(self.delete_candidates_after_finalize.get())),
+            target=self._run_finalize_many_thread,
+            args=([(s, choices)], mode, bool(self.delete_candidates_after_finalize.get()), self.current_scan_path(s.folder)),
             daemon=True,
         ).start()
 
-    def _run_finalize_thread(self, s: SpineSet, choices: list[tuple[PageCandidates, Candidate, str]], mode: str, delete_candidates: bool):
+    def finalize_all_sets(self):
+        if not self.spine_sets:
+            return
+        mode = self.normalized_finalize_mode()
+        plans: list[tuple[SpineSet, list[tuple[PageCandidates, Candidate, str]]]] = []
+        no_choices = 0
+        missing_pages: list[tuple[SpineSet, PageCandidates]] = []
+        total_pages = 0
+        for s in self.spine_sets:
+            choices, missing = self.finalize_choices(s)
+            if not choices:
+                no_choices += 1
+                continue
+            plans.append((s, choices))
+            total_pages += len(choices)
+            missing_pages.extend((s, p) for p in missing)
+
+        if not plans:
+            messagebox.showerror("Nothing to finalize", "No marked-correct or activated candidate choices were found in the loaded tree.")
+            return
+
+        sample = "\n".join(f"{s.folder.name}: page {p.page_index} {p.atlas_page}" for s, p in missing_pages[:8])
+        if len(missing_pages) > 8:
+            sample += f"\n...and {len(missing_pages) - 8} more"
+        details = [
+            f"Finalize {len(plans)} set(s) and {total_pages} selected page(s)?",
+            "",
+            f"Finalize mode: {mode}",
+            f"Delete _candidates: {bool(self.delete_candidates_after_finalize.get())}",
+        ]
+        if missing_pages:
+            details.extend(["", f"{len(missing_pages)} page(s) in these sets have no selected candidate:", sample])
+        if no_choices:
+            details.extend(["", f"{no_choices} set(s) with no choices will be left untouched."])
+        details.extend(["", "Continue?"])
+        if not messagebox.askyesno("Finalize all loaded sets?", "\n".join(details), parent=self.root):
+            return
+        if not self.confirm_symlink_finalize_if_needed(mode):
+            return
+
+        scan_path = self.current_scan_path(self.spine_sets[0].folder)
+        threading.Thread(
+            target=self._run_finalize_many_thread,
+            args=(plans, mode, bool(self.delete_candidates_after_finalize.get()), scan_path),
+            daemon=True,
+        ).start()
+
+    def _run_finalize_one_set(self, s: SpineSet, choices: list[tuple[PageCandidates, Candidate, str]], mode: str, delete_candidates: bool) -> int:
+        if not s.atlas:
+            raise RuntimeError(f"No atlas found in {s.folder}")
+        atlas_pages = parse_atlas_pages(s.atlas)
+        if not atlas_pages:
+            raise RuntimeError(f"Could not parse atlas pages from {s.atlas}")
+
+        finalized = 0
+        remaining_by_identity: dict[str, int] = {}
+        for _page, candidate, _source in choices:
+            identity = candidate_identity(candidate)
+            remaining_by_identity[identity] = remaining_by_identity.get(identity, 0) + 1
+        self.root.after(0, self.log_line, f"[finalize] {s.folder}")
+        for page, candidate, source in choices:
+            if page.page_index < 1 or page.page_index > len(atlas_pages):
+                raise IndexError(f"Page {page.page_index} is out of range for {s.atlas.name}")
+            target_name = Path(atlas_pages[page.page_index - 1]["name"]).name
+            if not target_name:
+                raise RuntimeError(f"Atlas page {page.page_index} has no usable filename")
+            target = s.folder / target_name
+            key = set_key(s, page)
+            identity = candidate_identity(candidate)
+            place_mode = "copy" if mode == "move" and remaining_by_identity.get(identity, 0) > 1 else mode
+            placed = place_final_texture(candidate.file_path, target, place_mode)
+            remaining_by_identity[identity] = remaining_by_identity.get(identity, 1) - 1
+            finalized += 1
+            self.remember_used_candidate(key, page, candidate, f"finalized via {source}")
+            self.root.after(
+                0,
+                self.log_line,
+                f"[OK] finalized page {page.page_index} rank {candidate.rank} -> {target.name} via {placed} ({source})",
+            )
+
+        if delete_candidates:
+            cand_root = s.folder / "_candidates"
+            if cand_root.exists():
+                shutil.rmtree(cand_root)
+                self.root.after(0, self.log_line, f"[OK] deleted {cand_root}")
+        return finalized
+
+    def _run_finalize_many_thread(self, plans: list[tuple[SpineSet, list[tuple[PageCandidates, Candidate, str]]]], mode: str, delete_candidates: bool, scan_path: Path):
         try:
-            if not s.atlas:
-                raise RuntimeError(f"No atlas found in {s.folder}")
-            atlas_pages = parse_atlas_pages(s.atlas)
-            if not atlas_pages:
-                raise RuntimeError(f"Could not parse atlas pages from {s.atlas}")
-
-            finalized = 0
-            remaining_by_identity: dict[str, int] = {}
-            for _page, candidate, _source in choices:
-                identity = candidate_identity(candidate)
-                remaining_by_identity[identity] = remaining_by_identity.get(identity, 0) + 1
-            self.root.after(0, self.log_line, f"[finalize] {s.folder}")
-            for page, candidate, source in choices:
-                if page.page_index < 1 or page.page_index > len(atlas_pages):
-                    raise IndexError(f"Page {page.page_index} is out of range for {s.atlas.name}")
-                target_name = Path(atlas_pages[page.page_index - 1]["name"]).name
-                if not target_name:
-                    raise RuntimeError(f"Atlas page {page.page_index} has no usable filename")
-                target = s.folder / target_name
-                identity = candidate_identity(candidate)
-                place_mode = "copy" if mode == "move" and remaining_by_identity.get(identity, 0) > 1 else mode
-                placed = place_final_texture(candidate.file_path, target, place_mode)
-                remaining_by_identity[identity] = remaining_by_identity.get(identity, 1) - 1
-                finalized += 1
-                self.root.after(
-                    0,
-                    self.log_line,
-                    f"[OK] finalized page {page.page_index} rank {candidate.rank} -> {target.name} via {placed} ({source})",
-                )
-
-            if delete_candidates:
-                cand_root = s.folder / "_candidates"
-                if cand_root.exists():
-                    shutil.rmtree(cand_root)
-                    self.root.after(0, self.log_line, f"[OK] deleted {cand_root}")
-
-            self.root.after(0, self.log_line, f"[OK] finalize complete: {finalized} page(s)")
-            self.root.after(0, self.scan_root, s.folder)
+            total = 0
+            for s, choices in plans:
+                total += self._run_finalize_one_set(s, choices, mode, delete_candidates)
+            save_state(self.state)
+            self.root.after(0, self.log_line, f"[OK] finalize complete: {total} page(s) across {len(plans)} set(s)")
+            self.root.after(0, self.scan_root, scan_path)
         except Exception as exc:
             self.root.after(0, self.log_line, f"[ERR] finalize failed: {exc}")
 
