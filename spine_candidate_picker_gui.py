@@ -9,6 +9,7 @@ import sys
 import threading
 import math
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 import tkinter as tk
@@ -207,15 +208,20 @@ def save_state(state: dict) -> None:
     tmp.replace(STATE_PATH)
 
 
+@lru_cache(maxsize=200_000)
+def resolved_path_text(raw: str) -> str:
+    try:
+        return str(Path(raw).expanduser().resolve())
+    except OSError:
+        return str(raw).strip()
+
+
 def set_key(spine_set: SpineSet, page: PageCandidates) -> str:
-    return f"{spine_set.folder.resolve()}|page{page.page_index:02d}|{page.atlas_page}"
+    return f"{resolved_path_text(str(spine_set.folder))}|page{page.page_index:02d}|{page.atlas_page}"
 
 
 def path_key(path: Path | str) -> str:
-    try:
-        return str(Path(path).expanduser().resolve()).lower()
-    except OSError:
-        return str(path).strip().lower()
+    return resolved_path_text(str(path)).lower()
 
 
 def candidate_identity(candidate: Candidate) -> str:
@@ -227,10 +233,11 @@ def candidate_identity(candidate: Candidate) -> str:
     return path_key(candidate.file_path)
 
 
-def _candidate_name_aliases(raw: str) -> set[str]:
+@lru_cache(maxsize=200_000)
+def _candidate_name_aliases_cached(raw: str) -> tuple[str, ...]:
     name = Path(str(raw).strip().strip('"')).name.lower()
     if not name:
-        return set()
+        return ()
     # Staged files are named like 0001_score123_original_00001.png.
     clean_name = re.sub(r"^\d{4}_score-?\d+_", "", name)
     stem = Path(clean_name).stem
@@ -238,7 +245,11 @@ def _candidate_name_aliases(raw: str) -> set[str]:
     m = re.search(r"(?:^|[_\-.])(\d{5,})$", stem)
     if m:
         aliases.add(f"suffix:{m.group(1)}")
-    return aliases
+    return tuple(sorted(aliases))
+
+
+def _candidate_name_aliases(raw: str) -> set[str]:
+    return set(_candidate_name_aliases_cached(str(raw)))
 
 
 def candidate_aliases(candidate: Candidate) -> set[str]:
@@ -359,6 +370,15 @@ class CandidatePickerApp:
         self.path_var = tk.StringVar()
         self.thumbnail_image = None
         self.thumbnail_path: Path | None = None
+        self._thumbnail_size: tuple[int, int] | None = None
+        self._candidate_alias_cache: dict[int, set[str]] = {}
+        self._visible_candidates_cache: dict[tuple[int, int, bool], list[Candidate]] = {}
+        self._atlas_pages_cache: dict[str, tuple[tuple[int | None, int | None], list[dict]]] = {}
+        self._image_size_cache: dict[str, tuple[tuple[int | None, int | None], tuple[int | None, int | None]]] = {}
+        self._blacklist_global_aliases: set[str] = set()
+        self._correct_alias_owners: dict[str, set[str]] = {}
+        self._used_alias_owners: dict[str, set[str]] = {}
+        self.rebuild_state_indexes()
 
         self._build_ui()
         self._bind_keys()
@@ -506,6 +526,85 @@ class CandidatePickerApp:
         self.log.see(tk.END)
         self.status.set(line.rstrip())
 
+    def invalidate_visibility_cache(self) -> None:
+        self._visible_candidates_cache.clear()
+
+    def rebuild_state_indexes(self) -> None:
+        self._blacklist_global_aliases = {
+            str(alias).strip()
+            for alias in self.state.get("blacklist_global", {})
+            if str(alias).strip()
+        }
+
+        self._correct_alias_owners = {}
+        for key, entry in self.state.get("correct", {}).items():
+            owner = str(key)
+            for alias in state_entry_identities(entry):
+                self._correct_alias_owners.setdefault(alias, set()).add(owner)
+
+        self._used_alias_owners = {}
+        used_identity_cache: dict[tuple[str, str, str, tuple[str, ...]], frozenset[str]] = {}
+        for stored_alias, entry in self.state.get("used_global", {}).items():
+            owner = str(entry.get("set_key") or "")
+            signature = (
+                owner,
+                str(entry.get("candidate_file") or ""),
+                str(entry.get("source_path") or ""),
+                tuple(str(alias).strip() for alias in entry.get("aliases", []) or []),
+            )
+            cached_aliases = used_identity_cache.get(signature)
+            if cached_aliases is None:
+                cached_aliases = frozenset(state_entry_identities(entry))
+                used_identity_cache[signature] = cached_aliases
+            aliases = set(cached_aliases)
+            raw_alias = str(stored_alias).strip()
+            if raw_alias:
+                aliases.add(raw_alias)
+            for alias in aliases:
+                self._used_alias_owners.setdefault(alias, set()).add(owner)
+
+        self.invalidate_visibility_cache()
+
+    def aliases_for_candidate(self, candidate: Candidate) -> set[str]:
+        key = id(candidate)
+        aliases = self._candidate_alias_cache.get(key)
+        if aliases is None:
+            aliases = candidate_aliases(candidate)
+            self._candidate_alias_cache[key] = aliases
+        return aliases
+
+    def atlas_pages_for_set(self, spine_set: SpineSet) -> list[dict]:
+        if not spine_set.atlas:
+            return []
+        path = spine_set.atlas
+        try:
+            stat = path.stat()
+            stat_key = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            stat_key = (None, None)
+        cache_key = str(path)
+        cached = self._atlas_pages_cache.get(cache_key)
+        if cached and cached[0] == stat_key:
+            return cached[1]
+        pages = parse_atlas_pages(path)
+        self._atlas_pages_cache[cache_key] = (stat_key, pages)
+        return pages
+
+    def image_size_for_candidate(self, candidate: Candidate) -> tuple[int | None, int | None]:
+        path = candidate.file_path
+        try:
+            stat = path.stat()
+            stat_key = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            stat_key = (None, None)
+        cache_key = str(path)
+        cached = self._image_size_cache.get(cache_key)
+        if cached and cached[0] == stat_key:
+            return cached[1]
+        size = image_size(path)
+        self._image_size_cache[cache_key] = (stat_key, size)
+        return size
+
     def save_settings(self):
         self.state.setdefault("settings", {})
         self.state["settings"].update(
@@ -553,6 +652,7 @@ class CandidatePickerApp:
 
     def on_blacklist_filter_change(self):
         self.save_settings()
+        self.invalidate_visibility_cache()
         self.refresh_candidates()
         self.select_candidate_by_index(0)
 
@@ -593,6 +693,11 @@ class CandidatePickerApp:
         self.path_var.set(str(path))
         self.log_line(f"[scan] {path}")
         self.spine_sets = discover_spine_sets(path)
+        self._candidate_alias_cache.clear()
+        self._visible_candidates_cache.clear()
+        self._atlas_pages_cache.clear()
+        self._image_size_cache.clear()
+        self.rebuild_state_indexes()
         self.current_set_index = 0
         self.current_page_index = 0
         self.refresh_sets()
@@ -719,20 +824,16 @@ class CandidatePickerApp:
         return s, s.pages[self.current_page_index]
 
     def candidate_marked_correct(self, candidate: Candidate) -> bool:
-        aliases = candidate_aliases(candidate)
-        for entry in self.state.get("correct", {}).values():
-            if aliases & state_entry_identities(entry):
+        for alias in self.aliases_for_candidate(candidate):
+            if self._correct_alias_owners.get(alias):
                 return True
         return False
 
     def candidate_used_elsewhere(self, key: str, candidate: Candidate) -> bool:
-        aliases = candidate_aliases(candidate)
-        for correct_key, entry in self.state.get("correct", {}).items():
-            if correct_key != key and aliases & state_entry_identities(entry):
+        for alias in self.aliases_for_candidate(candidate):
+            if any(owner != key for owner in self._correct_alias_owners.get(alias, ())):
                 return True
-        for entry in self.state.get("used_global", {}).values():
-            owner = str(entry.get("set_key") or "")
-            if owner != key and aliases & state_entry_identities(entry):
+            if any(owner != key for owner in self._used_alias_owners.get(alias, ())):
                 return True
         return False
 
@@ -741,16 +842,24 @@ class CandidatePickerApp:
         page_black = self.state.get("blacklist", {}).get(key, {})
         if str(c.rank) in page_black:
             return True
-        aliases = candidate_aliases(c)
-        if any(alias in self.state.get("blacklist_global", {}) for alias in aliases):
+        aliases = self.aliases_for_candidate(c)
+        if aliases & self._blacklist_global_aliases:
             return True
         return self.candidate_used_elsewhere(key, c)
 
     def visible_candidates(self, pair: tuple[SpineSet, PageCandidates]) -> list[Candidate]:
         s, p = pair
-        if not self.hide_blacklisted.get():
-            return list(p.candidates)
-        return [c for c in p.candidates if not self.is_candidate_blacklisted(s, p, c)]
+        hide = bool(self.hide_blacklisted.get())
+        cache_key = (id(s), id(p), hide)
+        cached = self._visible_candidates_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        if not hide:
+            visible = list(p.candidates)
+        else:
+            visible = [c for c in p.candidates if not self.is_candidate_blacklisted(s, p, c)]
+        self._visible_candidates_cache[cache_key] = visible
+        return list(visible)
 
     def refresh_candidates(self):
         self.cand_tree.delete(*self.cand_tree.get_children())
@@ -786,16 +895,19 @@ class CandidatePickerApp:
             return
         idx = max(0, min(idx, len(candidates) - 1))
         rank = candidates[idx].rank
+        self.current_candidate_rank = rank
         self.cand_tree.selection_set(str(rank))
         self.cand_tree.focus(str(rank))
         self.cand_tree.see(str(rank))
-        self.current_candidate_rank = rank
         self.update_preview()
 
     def on_candidate_select(self, _event=None):
         sel = self.cand_tree.selection()
         if sel:
-            self.current_candidate_rank = int(sel[0])
+            rank = int(sel[0])
+            if rank == self.current_candidate_rank:
+                return
+            self.current_candidate_rank = rank
             self.update_preview()
 
     def selected_candidate(self) -> Candidate | None:
@@ -816,6 +928,7 @@ class CandidatePickerApp:
         if not c:
             self.thumbnail_image = None
             self.thumbnail_path = None
+            self._thumbnail_size = None
             canvas.create_text(
                 max(canvas.winfo_width() // 2, 120),
                 max(canvas.winfo_height() // 2, 80),
@@ -828,8 +941,10 @@ class CandidatePickerApp:
         max_w = max(canvas.winfo_width() - 16, 80)
         max_h = max(canvas.winfo_height() - 16, 80)
         try:
-            self.thumbnail_image = self.load_thumbnail(path, max_w, max_h)
-            self.thumbnail_path = path
+            if self.thumbnail_path != path or self._thumbnail_size != (max_w, max_h) or self.thumbnail_image is None:
+                self.thumbnail_image = self.load_thumbnail(path, max_w, max_h)
+                self.thumbnail_path = path
+                self._thumbnail_size = (max_w, max_h)
             if self.thumbnail_image is None:
                 raise RuntimeError("unsupported image format")
             img_w = self.thumbnail_image.width()
@@ -839,6 +954,7 @@ class CandidatePickerApp:
         except Exception as exc:
             self.thumbnail_image = None
             self.thumbnail_path = None
+            self._thumbnail_size = None
             canvas.create_text(
                 max(canvas.winfo_width() // 2, 120),
                 max(canvas.winfo_height() // 2, 80),
@@ -875,7 +991,7 @@ class CandidatePickerApp:
             return
         s, p = pair
         c = self.selected_candidate()
-        atlas_pages = parse_atlas_pages(s.atlas) if s.atlas else []
+        atlas_pages = self.atlas_pages_for_set(s)
         lines = [
             f"set: {s.folder}",
             f"atlas: {s.atlas.name if s.atlas else '[missing]'}",
@@ -886,7 +1002,7 @@ class CandidatePickerApp:
         if atlas_pages:
             lines.append("atlas_pages: " + ", ".join(f"{x['name']} {x['size']}".strip() for x in atlas_pages))
         if c:
-            w, h = image_size(c.file_path)
+            w, h = self.image_size_for_candidate(c)
             lines += [
                 "",
                 f"candidate_rank: {c.rank}",
@@ -1005,7 +1121,7 @@ class CandidatePickerApp:
             return
         s, p = pair
         key = set_key(s, p)
-        aliases = sorted(candidate_aliases(c))
+        aliases = sorted(self.aliases_for_candidate(c))
         self.state.setdefault("correct", {})[key] = {
             "rank": c.rank,
             "score": c.score,
@@ -1017,6 +1133,7 @@ class CandidatePickerApp:
         for alias in aliases:
             self.state.get("blacklist_global", {}).pop(alias, None)
         self.remember_used_candidate(key, p, c, "marked correct")
+        self.rebuild_state_indexes()
         save_state(self.state)
         self.refresh_pages()
         self.refresh_candidates()
@@ -1033,10 +1150,10 @@ class CandidatePickerApp:
         self.state.setdefault("blacklist", {}).setdefault(key, {})[str(c.rank)] = {
             "candidate_file": str(c.file_path),
             "source_path": c.source_path,
-            "aliases": sorted(candidate_aliases(c)),
+            "aliases": sorted(self.aliases_for_candidate(c)),
             "reason": reason,
         }
-        aliases = sorted(candidate_aliases(c))
+        aliases = sorted(self.aliases_for_candidate(c))
         global_note = "local only; already marked correct elsewhere"
         if not self.candidate_marked_correct(c):
             entry = {
@@ -1050,6 +1167,7 @@ class CandidatePickerApp:
                 self.state.setdefault("blacklist_global", {})[alias] = entry
             global_note = "global"
         save_state(self.state)
+        self.rebuild_state_indexes()
         self.refresh_pages()
         self.refresh_candidates()
         self.select_candidate_by_index(0)
@@ -1108,7 +1226,7 @@ class CandidatePickerApp:
         return choices, missing
 
     def remember_used_candidate(self, key: str, page: PageCandidates, candidate: Candidate, source: str) -> None:
-        aliases = sorted(candidate_aliases(candidate))
+        aliases = sorted(self.aliases_for_candidate(candidate))
         entry = {
             "set_key": key,
             "page_index": page.page_index,

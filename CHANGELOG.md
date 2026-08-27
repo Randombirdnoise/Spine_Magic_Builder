@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1 - 2026-08-27
+
+- Optimized GUI candidate navigation with cached blacklist, used-image, alias, atlas-page, and image-size lookups.
+- Kept global hiding behavior intact while avoiding repeated full-state scans during next/previous candidate movement.
+- Reduced duplicate preview refreshes when selecting candidates programmatically.
+
 ## 1.1.0 - 2026-08-16
 
 - Added GUI **Finalize All** with confirmation, incomplete-set summary, and scan-root refresh after completion.
