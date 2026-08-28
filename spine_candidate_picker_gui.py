@@ -7,7 +7,8 @@ import shutil
 import subprocess
 import sys
 import threading
-import math
+import time
+import traceback
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -47,6 +48,29 @@ def state_path() -> Path:
 
 DEFAULT_VIEWER = default_viewer_path()
 STATE_PATH = state_path()
+DEBUG_LOG_PATH = STATE_PATH.with_name("spine_candidate_picker_debug.log")
+DEBUG_LOG_MAX_BYTES = 1_000_000
+DEBUG_LOG_LOCK = threading.Lock()
+
+
+def debug_log(message: str) -> None:
+    try:
+        DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with DEBUG_LOG_LOCK:
+            if DEBUG_LOG_PATH.exists() and DEBUG_LOG_PATH.stat().st_size > DEBUG_LOG_MAX_BYTES:
+                rotated = DEBUG_LOG_PATH.with_suffix(".log.1")
+                try:
+                    if rotated.exists():
+                        rotated.unlink()
+                    DEBUG_LOG_PATH.replace(rotated)
+                except OSError:
+                    pass
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            clean = str(message).replace("\r", "\\r").replace("\n", "\\n")
+            with DEBUG_LOG_PATH.open("a", encoding="utf-8", newline="\n") as f:
+                f.write(f"{stamp} {clean}\n")
+    except OSError:
+        pass
 
 
 @dataclass
@@ -190,6 +214,12 @@ def discover_spine_sets(root: Path) -> list[SpineSet]:
         if pages:
             sets.append(SpineSet(folder=set_dir, atlas=atlases[0] if atlases else None, skeletons=skeletons, pages=pages))
     return sets
+
+
+def spine_set_counts(spine_sets: list[SpineSet]) -> tuple[int, int, int]:
+    pages = sum(len(s.pages) for s in spine_sets)
+    candidates = sum(len(p.candidates) for s in spine_sets for p in s.pages)
+    return len(spine_sets), pages, candidates
 
 
 def load_state() -> dict:
@@ -371,6 +401,8 @@ class CandidatePickerApp:
         self.thumbnail_image = None
         self.thumbnail_path: Path | None = None
         self._thumbnail_size: tuple[int, int] | None = None
+        self._thumbnail_after_id: str | None = None
+        self._thumbnail_generation = 0
         self._candidate_alias_cache: dict[int, set[str]] = {}
         self._visible_candidates_cache: dict[tuple[int, int, bool], list[Candidate]] = {}
         self._atlas_pages_cache: dict[str, tuple[tuple[int | None, int | None], list[dict]]] = {}
@@ -378,6 +410,9 @@ class CandidatePickerApp:
         self._blacklist_global_aliases: set[str] = set()
         self._correct_alias_owners: dict[str, set[str]] = {}
         self._used_alias_owners: dict[str, set[str]] = {}
+        self._scan_generation = 0
+        self._materialize_generation = 0
+        self._materialize_busy = False
         self.rebuild_state_indexes()
 
         self._build_ui()
@@ -467,7 +502,7 @@ class CandidatePickerApp:
             self.cand_tree.column(col, width=width)
         self.cand_tree.pack(fill=tk.BOTH, expand=True)
         self.cand_tree.bind("<<TreeviewSelect>>", self.on_candidate_select)
-        self.cand_tree.bind("<Double-1>", lambda _e: self.materialize_selected())
+        self.cand_tree.bind("<Double-1>", self.on_candidate_double_click)
 
         controls = ttk.Frame(right, padding=(0, 8, 0, 0))
         controls.pack(fill=tk.X)
@@ -530,6 +565,7 @@ class CandidatePickerApp:
         self._visible_candidates_cache.clear()
 
     def rebuild_state_indexes(self) -> None:
+        start = time.perf_counter()
         self._blacklist_global_aliases = {
             str(alias).strip()
             for alias in self.state.get("blacklist_global", {})
@@ -564,6 +600,13 @@ class CandidatePickerApp:
                 self._used_alias_owners.setdefault(alias, set()).add(owner)
 
         self.invalidate_visibility_cache()
+        debug_log(
+            "rebuild_state_indexes "
+            f"elapsed={time.perf_counter() - start:.3f}s "
+            f"correct={len(self.state.get('correct', {}))} "
+            f"blacklist_global={len(self.state.get('blacklist_global', {}))} "
+            f"used_global={len(self.state.get('used_global', {}))}"
+        )
 
     def aliases_for_candidate(self, candidate: Candidate) -> set[str]:
         key = id(candidate)
@@ -692,7 +735,42 @@ class CandidatePickerApp:
             return
         self.path_var.set(str(path))
         self.log_line(f"[scan] {path}")
-        self.spine_sets = discover_spine_sets(path)
+        self._scan_generation += 1
+        scan_generation = self._scan_generation
+        self.root.configure(cursor="watch")
+        threading.Thread(target=self._run_scan_thread, args=(scan_generation, path), daemon=True).start()
+
+    def _run_scan_thread(self, scan_generation: int, path: Path):
+        start = time.perf_counter()
+        try:
+            spine_sets = discover_spine_sets(path)
+            set_count, page_count, candidate_count = spine_set_counts(spine_sets)
+            debug_log(
+                "scan_worker_done "
+                f"generation={scan_generation} elapsed={time.perf_counter() - start:.3f}s "
+                f"sets={set_count} pages={page_count} candidates={candidate_count} path={path}"
+            )
+            self.root.after(0, self._finish_scan, scan_generation, path, spine_sets, None)
+        except Exception as exc:
+            debug_log(
+                "scan_worker_error "
+                f"generation={scan_generation} elapsed={time.perf_counter() - start:.3f}s "
+                f"path={path} error={exc} traceback={traceback.format_exc()}"
+            )
+            self.root.after(0, self._finish_scan, scan_generation, path, None, exc)
+
+    def _finish_scan(self, scan_generation: int, path: Path, spine_sets: list[SpineSet] | None, error: Exception | None):
+        start = time.perf_counter()
+        if scan_generation != self._scan_generation:
+            debug_log(f"scan_finish_ignored generation={scan_generation} current={self._scan_generation} path={path}")
+            return
+        self.root.configure(cursor="")
+        if error:
+            self.log_line(f"[ERR] scan failed: {error}")
+            messagebox.showerror("Scan failed", str(error))
+            return
+        self.spine_sets = spine_sets or []
+        set_count, page_count, candidate_count = spine_set_counts(self.spine_sets)
         self._candidate_alias_cache.clear()
         self._visible_candidates_cache.clear()
         self._atlas_pages_cache.clear()
@@ -706,6 +784,11 @@ class CandidatePickerApp:
             self.log_line(f"[OK] found {len(self.spine_sets)} built set(s) with candidates")
         else:
             self.log_line("[MISS] no built sets with _candidates found. Use Build Candidates first if this is raw source.")
+        debug_log(
+            "scan_finish_ui "
+            f"generation={scan_generation} elapsed={time.perf_counter() - start:.3f}s "
+            f"sets={set_count} pages={page_count} candidates={candidate_count} path={path}"
+        )
 
     def build_candidates(self):
         path = Path(self.path_var.get().strip('"'))
@@ -738,18 +821,22 @@ class CandidatePickerApp:
             str(stage_limit),
         ]
         self.log_line("[run] " + " ".join(f'"{x}"' if " " in x else x for x in cmd))
+        debug_log(f"builder_start path={path} stage_limit={stage_limit} link_mode={self.link_mode.get()}")
         threading.Thread(target=self._run_builder_thread, args=(cmd, path), daemon=True).start()
 
     def _run_builder_thread(self, cmd: list[str], path: Path):
+        start = time.perf_counter()
         try:
             proc = subprocess.Popen(cmd, cwd=str(SCRIPT_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
             assert proc.stdout
             for line in proc.stdout:
                 self.root.after(0, self.log_line, line)
             code = proc.wait()
+            debug_log(f"builder_done elapsed={time.perf_counter() - start:.3f}s code={code} path={path}")
             self.root.after(0, self.log_line, f"[exit] builder returned {code}")
             self.root.after(0, self.scan_root, path)
         except Exception as exc:
+            debug_log(f"builder_error elapsed={time.perf_counter() - start:.3f}s path={path} error={exc} traceback={traceback.format_exc()}")
             self.root.after(0, self.log_line, f"[ERR] builder failed: {exc}")
 
     def refresh_sets(self):
@@ -779,10 +866,13 @@ class CandidatePickerApp:
         self.select_page(0)
 
     def refresh_pages(self):
+        start = time.perf_counter()
         self.page_tree.delete(*self.page_tree.get_children())
         if not self.spine_sets:
+            debug_log("refresh_pages elapsed=0.000s no_sets")
             return
         s = self.spine_sets[self.current_set_index]
+        candidate_count = 0
         for idx, p in enumerate(s.pages):
             key = set_key(s, p)
             cached = ""
@@ -790,9 +880,15 @@ class CandidatePickerApp:
                 cached = f"OK {self.state['correct'][key].get('rank')}"
             elif key in self.state.get("skipped", {}):
                 cached = "skip"
+            candidate_count += len(p.candidates)
             visible_count = len(self.visible_candidates((s, p))) if self.hide_blacklisted.get() else len(p.candidates)
             count = visible_count if visible_count == len(p.candidates) else f"{visible_count}/{len(p.candidates)}"
             self.page_tree.insert("", tk.END, iid=str(idx), values=(f"{p.page_index}: {p.atlas_page}", p.requested_size, count, cached))
+        debug_log(
+            "refresh_pages "
+            f"elapsed={time.perf_counter() - start:.3f}s "
+            f"set={s.folder} pages={len(s.pages)} candidates={candidate_count} hide={bool(self.hide_blacklisted.get())}"
+        )
 
     def select_page(self, idx: int):
         if not self.spine_sets:
@@ -862,9 +958,11 @@ class CandidatePickerApp:
         return list(visible)
 
     def refresh_candidates(self):
+        start = time.perf_counter()
         self.cand_tree.delete(*self.cand_tree.get_children())
         pair = self.current_set_page()
         if not pair:
+            debug_log("refresh_candidates elapsed=0.000s no_page")
             return
         s, p = pair
         visible_ranks = set()
@@ -883,6 +981,12 @@ class CandidatePickerApp:
         if hidden_count:
             self.status.set(f"[filter] hid {hidden_count} blacklisted candidate(s) on page {p.page_index}")
         self.update_preview()
+        debug_log(
+            "refresh_candidates "
+            f"elapsed={time.perf_counter() - start:.3f}s "
+            f"set={s.folder} page={p.page_index} candidates={len(p.candidates)} "
+            f"visible={len(visible_ranks)} hidden={hidden_count} hide={bool(self.hide_blacklisted.get())}"
+        )
 
     def select_candidate_by_index(self, idx: int):
         pair = self.current_set_page()
@@ -909,6 +1013,15 @@ class CandidatePickerApp:
                 return
             self.current_candidate_rank = rank
             self.update_preview()
+
+    def on_candidate_double_click(self, event):
+        row = self.cand_tree.identify_row(event.y)
+        if row:
+            self.current_candidate_rank = int(row)
+            self.cand_tree.selection_set(row)
+            self.cand_tree.focus(row)
+            self.cand_tree.see(row)
+        self.materialize_selected()
 
     def selected_candidate(self) -> Candidate | None:
         pair = self.current_set_page()
@@ -940,21 +1053,100 @@ class CandidatePickerApp:
         path = c.file_path
         max_w = max(canvas.winfo_width() - 16, 80)
         max_h = max(canvas.winfo_height() - 16, 80)
+        if self.thumbnail_path == path and self._thumbnail_size == (max_w, max_h) and self.thumbnail_image is not None:
+            self.draw_thumbnail_image(path, max_w, max_h)
+            return
+
+        if self._thumbnail_after_id:
+            try:
+                self.root.after_cancel(self._thumbnail_after_id)
+            except tk.TclError:
+                pass
+            self._thumbnail_after_id = None
+
+        self.thumbnail_image = None
+        self.thumbnail_path = None
+        self._thumbnail_size = None
+        self._thumbnail_generation += 1
+        thumbnail_generation = self._thumbnail_generation
+        canvas.create_text(
+            max(canvas.winfo_width() // 2, 120),
+            max(canvas.winfo_height() // 2, 80),
+            text=f"Loading preview\n{path.name}",
+            fill="#d0d0d0",
+            justify=tk.CENTER,
+        )
+        self._thumbnail_after_id = self.root.after(90, self._start_thumbnail_load, thumbnail_generation, path, max_w, max_h)
+
+    def draw_thumbnail_image(self, path: Path, max_w: int, max_h: int):
+        canvas = self.thumbnail_canvas
+        canvas.delete("all")
+        if self.thumbnail_image is None:
+            return
+        img_w = self.thumbnail_image.width()
+        img_h = self.thumbnail_image.height()
+        canvas.create_image(max_w // 2 + 8, max_h // 2 + 8, image=self.thumbnail_image, anchor=tk.CENTER)
+        canvas.create_text(8, 8, text=f"{path.name}  {img_w}x{img_h} preview", anchor=tk.NW, fill="#f0f0f0")
+
+    def _start_thumbnail_load(self, thumbnail_generation: int, path: Path, max_w: int, max_h: int):
+        self._thumbnail_after_id = None
+        debug_log(f"thumbnail_start generation={thumbnail_generation} path={path} max={max_w}x{max_h}")
+        threading.Thread(target=self._run_thumbnail_thread, args=(thumbnail_generation, path, max_w, max_h), daemon=True).start()
+
+    def _run_thumbnail_thread(self, thumbnail_generation: int, path: Path, max_w: int, max_h: int):
+        start = time.perf_counter()
         try:
-            if self.thumbnail_path != path or self._thumbnail_size != (max_w, max_h) or self.thumbnail_image is None:
-                self.thumbnail_image = self.load_thumbnail(path, max_w, max_h)
-                self.thumbnail_path = path
-                self._thumbnail_size = (max_w, max_h)
-            if self.thumbnail_image is None:
-                raise RuntimeError("unsupported image format")
-            img_w = self.thumbnail_image.width()
-            img_h = self.thumbnail_image.height()
-            canvas.create_image(max_w // 2 + 8, max_h // 2 + 8, image=self.thumbnail_image, anchor=tk.CENTER)
-            canvas.create_text(8, 8, text=f"{path.name}  {img_w}x{img_h} preview", anchor=tk.NW, fill="#f0f0f0")
+            image_data = self.load_thumbnail_data(path, max_w, max_h)
+            debug_log(
+                "thumbnail_worker_done "
+                f"generation={thumbnail_generation} elapsed={time.perf_counter() - start:.3f}s path={path}"
+            )
+            self.root.after(0, self._finish_thumbnail_load, thumbnail_generation, path, max_w, max_h, image_data, None)
+        except Exception as exc:
+            debug_log(
+                "thumbnail_worker_error "
+                f"generation={thumbnail_generation} elapsed={time.perf_counter() - start:.3f}s "
+                f"path={path} error={exc} traceback={traceback.format_exc()}"
+            )
+            self.root.after(0, self._finish_thumbnail_load, thumbnail_generation, path, max_w, max_h, None, exc)
+
+    def _finish_thumbnail_load(self, thumbnail_generation: int, path: Path, max_w: int, max_h: int, image_data, error: Exception | None):
+        if thumbnail_generation != self._thumbnail_generation:
+            debug_log(f"thumbnail_finish_ignored generation={thumbnail_generation} current={self._thumbnail_generation} path={path}")
+            return
+        c = self.selected_candidate()
+        if not c or c.file_path != path:
+            debug_log(f"thumbnail_finish_stale generation={thumbnail_generation} path={path}")
+            return
+        canvas = self.thumbnail_canvas
+        if error or not image_data:
+            self.thumbnail_image = None
+            self.thumbnail_path = None
+            self._thumbnail_size = None
+            canvas.delete("all")
+            canvas.create_text(
+                max(canvas.winfo_width() // 2, 120),
+                max(canvas.winfo_height() // 2, 80),
+                text=f"Preview unavailable\n{path.name}\n{error or 'unsupported image format'}",
+                fill="#d0d0d0",
+                justify=tk.CENTER,
+            )
+            return
+        try:
+            from PIL import Image, ImageTk  # type: ignore
+
+            mode, size, raw = image_data
+            im = Image.frombytes(mode, size, raw)
+            self.thumbnail_image = ImageTk.PhotoImage(im)
+            self.thumbnail_path = path
+            self._thumbnail_size = (max_w, max_h)
+            self.draw_thumbnail_image(path, max_w, max_h)
+            debug_log(f"thumbnail_finish_ui generation={thumbnail_generation} path={path} size={size[0]}x{size[1]}")
         except Exception as exc:
             self.thumbnail_image = None
             self.thumbnail_path = None
             self._thumbnail_size = None
+            canvas.delete("all")
             canvas.create_text(
                 max(canvas.winfo_width() // 2, 120),
                 max(canvas.winfo_height() // 2, 80),
@@ -962,26 +1154,18 @@ class CandidatePickerApp:
                 fill="#d0d0d0",
                 justify=tk.CENTER,
             )
+            debug_log(f"thumbnail_finish_error generation={thumbnail_generation} path={path} error={exc} traceback={traceback.format_exc()}")
 
-    def load_thumbnail(self, path: Path, max_w: int, max_h: int):
-        try:
-            from PIL import Image, ImageTk  # type: ignore
+    def load_thumbnail_data(self, path: Path, max_w: int, max_h: int):
+        from PIL import Image  # type: ignore
 
-            with Image.open(path) as im:
-                im.thumbnail((max_w, max_h))
-                if im.mode not in ("RGB", "RGBA"):
-                    im = im.convert("RGBA")
-                return ImageTk.PhotoImage(im.copy())
-        except ImportError:
-            pass
-
-        if path.suffix.lower() != ".png":
-            return None
-        img = tk.PhotoImage(file=str(path))
-        factor = max(1, math.ceil(img.width() / max_w), math.ceil(img.height() / max_h))
-        if factor > 1:
-            img = img.subsample(factor, factor)
-        return img
+        with Image.open(path) as im:
+            im.thumbnail((max_w, max_h))
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA")
+            else:
+                im = im.copy()
+            return im.mode, im.size, im.tobytes()
 
     def update_preview(self):
         self.preview.delete("1.0", tk.END)
@@ -1032,9 +1216,16 @@ class CandidatePickerApp:
         if not pair or not c:
             return
         s, p = pair
+        if self._materialize_busy:
+            self.status.set("Activation already running; wait for it to finish.")
+            debug_log(f"materialize_ignored_busy set={s.folder} page={p.page_index} rank={c.rank}")
+            return
         if not self.materializer.exists():
             messagebox.showerror("Missing materializer", str(self.materializer))
             return
+        self._materialize_busy = True
+        self._materialize_generation += 1
+        materialize_generation = self._materialize_generation
         cmd = [
             sys.executable,
             str(self.materializer),
@@ -1048,19 +1239,45 @@ class CandidatePickerApp:
             self.link_mode.get(),
         ]
         self.log_line(f"[activate] page {p.page_index} rank {c.rank}: {c.file_path.name}")
-        threading.Thread(target=self._run_materialize_thread, args=(cmd,), daemon=True).start()
+        debug_log(
+            "materialize_start "
+            f"generation={materialize_generation} set={s.folder} page={p.page_index} "
+            f"rank={c.rank} link_mode={self.link_mode.get()} file={c.file_path}"
+        )
+        threading.Thread(target=self._run_materialize_thread, args=(materialize_generation, cmd), daemon=True).start()
 
-    def _run_materialize_thread(self, cmd: list[str]):
+    def _run_materialize_thread(self, materialize_generation: int, cmd: list[str]):
+        start = time.perf_counter()
         try:
             proc = subprocess.run(cmd, cwd=str(SCRIPT_DIR), capture_output=True, text=True, encoding="utf-8", errors="replace")
             out = (proc.stdout or "") + (proc.stderr or "")
-            for line in out.splitlines():
-                self.root.after(0, self.log_line, line)
-            self.root.after(0, self.log_line, f"[exit] materializer returned {proc.returncode}")
-            if proc.returncode == 0 and self.auto_viewer.get():
-                self.root.after(0, self.launch_viewer)
+            debug_log(
+                "materialize_done "
+                f"generation={materialize_generation} elapsed={time.perf_counter() - start:.3f}s code={proc.returncode}"
+            )
+            self.root.after(0, self._finish_materialize, materialize_generation, proc.returncode, out, None)
         except Exception as exc:
-            self.root.after(0, self.log_line, f"[ERR] materialize failed: {exc}")
+            debug_log(
+                "materialize_error "
+                f"generation={materialize_generation} elapsed={time.perf_counter() - start:.3f}s "
+                f"error={exc} traceback={traceback.format_exc()}"
+            )
+            self.root.after(0, self._finish_materialize, materialize_generation, None, "", exc)
+
+    def _finish_materialize(self, materialize_generation: int, returncode: int | None, output: str, error: Exception | None):
+        if materialize_generation == self._materialize_generation:
+            self._materialize_busy = False
+        if error:
+            self.log_line(f"[ERR] materialize failed: {error}")
+            return
+        for line in output.splitlines():
+            self.log_line(line)
+        self.log_line(f"[exit] materializer returned {returncode}")
+        if materialize_generation != self._materialize_generation:
+            debug_log(f"materialize_finish_ignored generation={materialize_generation} current={self._materialize_generation}")
+            return
+        if returncode == 0 and self.auto_viewer.get():
+            self.launch_viewer()
 
     def launch_viewer(self):
         pair = self.current_set_page()
@@ -1115,6 +1332,7 @@ class CandidatePickerApp:
         self.select_page(self.current_page_index + 1)
 
     def mark_correct(self):
+        start = time.perf_counter()
         pair = self.current_set_page()
         c = self.selected_candidate()
         if not pair or not c:
@@ -1138,8 +1356,14 @@ class CandidatePickerApp:
         self.refresh_pages()
         self.refresh_candidates()
         self.log_line(f"[OK] marked correct: page {p.page_index} rank {c.rank}")
+        debug_log(
+            "mark_correct "
+            f"elapsed={time.perf_counter() - start:.3f}s set={s.folder} page={p.page_index} "
+            f"rank={c.rank} aliases={len(aliases)}"
+        )
 
     def blacklist_candidate(self):
+        start = time.perf_counter()
         pair = self.current_set_page()
         c = self.selected_candidate()
         if not pair or not c:
@@ -1172,8 +1396,14 @@ class CandidatePickerApp:
         self.refresh_candidates()
         self.select_candidate_by_index(0)
         self.log_line(f"[MISS] blacklisted: page {p.page_index} rank {c.rank} ({global_note})")
+        debug_log(
+            "blacklist "
+            f"elapsed={time.perf_counter() - start:.3f}s set={s.folder} page={p.page_index} "
+            f"rank={c.rank} aliases={len(aliases)} scope={global_note}"
+        )
 
     def skip_page(self):
+        start = time.perf_counter()
         pair = self.current_set_page()
         if not pair:
             return
@@ -1183,6 +1413,7 @@ class CandidatePickerApp:
         self.refresh_pages()
         self.next_page()
         self.log_line(f"[skip] page {p.page_index}: {p.atlas_page}")
+        debug_log(f"skip_page elapsed={time.perf_counter() - start:.3f}s set={s.folder} page={p.page_index}")
 
     def current_materialized_rank(self, s: SpineSet, page_index: int) -> int | None:
         note = s.folder / "_materialized_history" / f"page{page_index:02d}_current.txt"
@@ -1344,6 +1575,7 @@ class CandidatePickerApp:
         ).start()
 
     def _run_finalize_one_set(self, s: SpineSet, choices: list[tuple[PageCandidates, Candidate, str]], mode: str, delete_candidates: bool) -> int:
+        start = time.perf_counter()
         if not s.atlas:
             raise RuntimeError(f"No atlas found in {s.folder}")
         atlas_pages = parse_atlas_pages(s.atlas)
@@ -1381,17 +1613,30 @@ class CandidatePickerApp:
             if cand_root.exists():
                 shutil.rmtree(cand_root)
                 self.root.after(0, self.log_line, f"[OK] deleted {cand_root}")
+        debug_log(
+            "finalize_set_done "
+            f"elapsed={time.perf_counter() - start:.3f}s set={s.folder} pages={finalized} "
+            f"mode={mode} delete_candidates={delete_candidates}"
+        )
         return finalized
 
     def _run_finalize_many_thread(self, plans: list[tuple[SpineSet, list[tuple[PageCandidates, Candidate, str]]]], mode: str, delete_candidates: bool, scan_path: Path):
+        start = time.perf_counter()
+        debug_log(
+            "finalize_many_start "
+            f"sets={len(plans)} pages={sum(len(choices) for _s, choices in plans)} "
+            f"mode={mode} delete_candidates={delete_candidates} scan_path={scan_path}"
+        )
         try:
             total = 0
             for s, choices in plans:
                 total += self._run_finalize_one_set(s, choices, mode, delete_candidates)
             save_state(self.state)
+            debug_log(f"finalize_many_done elapsed={time.perf_counter() - start:.3f}s sets={len(plans)} pages={total}")
             self.root.after(0, self.log_line, f"[OK] finalize complete: {total} page(s) across {len(plans)} set(s)")
             self.root.after(0, self.scan_root, scan_path)
         except Exception as exc:
+            debug_log(f"finalize_many_error elapsed={time.perf_counter() - start:.3f}s error={exc} traceback={traceback.format_exc()}")
             self.root.after(0, self.log_line, f"[ERR] finalize failed: {exc}")
 
     def open_current_folder(self):

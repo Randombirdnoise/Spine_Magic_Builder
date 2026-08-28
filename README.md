@@ -42,6 +42,12 @@ The GUI remembers its viewer path and decisions in:
 %LOCALAPPDATA%\SpineMagicBuilder\spine_candidate_picker_state.json
 ```
 
+The GUI also writes a rolling timing/debug log to:
+
+```text
+%LOCALAPPDATA%\SpineMagicBuilder\spine_candidate_picker_debug.log
+```
+
 Set `SPINE_MAGIC_BUILDER_STATE` to use a different state-file location. Set `SPINE_VIEWER_EXE` to define the initial viewer path.
 
 ## Included programs
