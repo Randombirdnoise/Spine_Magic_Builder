@@ -34,11 +34,18 @@ The core builder uses only the Python standard library. Pillow adds broader imag
 5. Select a page and candidate, then press **Activate** or a number key.
 6. Point the GUI to `SpineViewer.exe` when prompted and visually validate the set.
 7. Mark the selection correct, blacklist it, or skip the page.
+8. Press **Finalize Set** once one set looks right, or **Finalize All** after all loaded sets are ready.
 
 The GUI remembers its viewer path and decisions in:
 
 ```text
 %LOCALAPPDATA%\SpineMagicBuilder\spine_candidate_picker_state.json
+```
+
+The GUI also writes a rolling timing/debug log to:
+
+```text
+%LOCALAPPDATA%\SpineMagicBuilder\spine_candidate_picker_debug.log
 ```
 
 Set `SPINE_MAGIC_BUILDER_STATE` to use a different state-file location. Set `SPINE_VIEWER_EXE` to define the initial viewer path.
@@ -49,7 +56,7 @@ Set `SPINE_MAGIC_BUILDER_STATE` to use a different state-file location. Set `SPI
 | --- | --- |
 | `spine_magic_builder.py` | Core recursive scanner and normalized-set builder. |
 | `spine_magic_builder_candidate_materializer_v3.py` | Extended builder with candidate staging and one-candidate materialization. |
-| `spine_candidate_picker_gui.py` | Tk GUI for reviewing, activating, and recording candidate choices. |
+| `spine_candidate_picker_gui.py` | Tk GUI for reviewing, activating, finalizing, and recording candidate choices. |
 | `Run_SpineMagic_Builder.bat` | Conservative copy-mode builder preset. |
 | `Run_SpineMagic_Builder_Candidate_Stage_v3.bat` | Candidate-staging preset optimized for large extracted trees. |
 | `Run_SpineCandidatePicker_GUI.bat` | GUI launcher; accepts an optional starting folder. |
@@ -112,6 +119,12 @@ Useful keys:
 | `F5` | Launch SpineViewer |
 
 Use the **Viewer exe** button if SpineViewer is not found automatically. The automatic search checks the repository folder, a `SpineViewer` subfolder, and the repository's parent folder. SpineVie[...]
+
+Use **Finalize Set** after visual validation to make the selected texture pages final. Finalize uses **Mark Correct** choices first, then falls back to the last activated candidate for pages that were activated but not explicitly marked. **Finalize All** applies the same rules to every loaded set that has at least one selected or activated page, with a confirmation dialog before anything is changed. The default finalize settings move selected page images into the built set and delete `_candidates`. If a staged candidate is a symlink, move mode dereferences it into a real local file so the finished set does not depend on the staged symlink target. Other finalize modes are copy, hardlink, and symlink; disable **Delete _candidates** to keep staged candidates for audit or later adjustment.
+
+Blacklist and used-image entries are stored per page and globally by candidate identity, cleaned staged filename, and trailing long numeric suffix such as `_00001`. Rejecting or accepting the same source image hides it in later folders as you continue reviewing, and candidate counts show the visible total when **Hide blacklisted** is enabled. **Hide blacklisted** is enabled by default and can be unchecked to review hidden candidates. If an image is already marked correct elsewhere, a later blacklist stays local to the current page.
+
+Use **Preview px** to resize the thumbnail area when a candidate needs closer inspection. The preview size is saved with the other GUI settings.
 
 ## Command-line usage
 
