@@ -432,6 +432,7 @@ class CandidatePickerApp:
         ttk.Button(top, text="Browse", command=self.browse_folder).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="Scan", command=lambda: self.scan_root(Path(self.path_var.get().strip('"')))).pack(side=tk.LEFT, padx=2)
         ttk.Button(top, text="Build Candidates", command=self.build_candidates).pack(side=tk.LEFT, padx=2)
+        ttk.Button(top, text="Atlas Matches", command=self.review_atlas_matches).pack(side=tk.LEFT, padx=2)
 
         opts = ttk.Frame(self.root, padding=(8, 0, 8, 6))
         opts.pack(fill=tk.X)
@@ -783,7 +784,10 @@ class CandidatePickerApp:
             self.select_set(0)
             self.log_line(f"[OK] found {len(self.spine_sets)} built set(s) with candidates")
         else:
-            self.log_line("[MISS] no built sets with _candidates found. Use Build Candidates first if this is raw source.")
+            if (path / "atlas_match_report.jsonl").is_file():
+                self.log_line("[OK] matching report found. Click Atlas Matches to review/build any skeleton-atlas pair.")
+            else:
+                self.log_line("[MISS] no built sets with _candidates found. Use Build Candidates first if this is raw source.")
         debug_log(
             "scan_finish_ui "
             f"generation={scan_generation} elapsed={time.perf_counter() - start:.3f}s "
@@ -807,13 +811,14 @@ class CandidatePickerApp:
             str(path),
             "--dims-fallback",
             "--min-hits",
-            "40",
+            "1",
             "--prefer-nearby-textures",
             "--prefer-consistent-texture-dir",
-            "--aggressive-atlas",
+            "--atlas-candidates",
+            "plausible",
             "--rewrite-pages-to-match-source",
             "--entity-mode",
-            "childdirs",
+            "off",
             "--link-mode",
             self.link_mode.get(),
             "--stage-dim-candidates",
@@ -824,17 +829,28 @@ class CandidatePickerApp:
         debug_log(f"builder_start path={path} stage_limit={stage_limit} link_mode={self.link_mode.get()}")
         threading.Thread(target=self._run_builder_thread, args=(cmd, path), daemon=True).start()
 
+    def review_atlas_matches(self):
+        from spine_atlas_review import open_atlas_review
+        existing = getattr(self, "atlas_review_window", None)
+        if existing is not None and not existing.closed:
+            existing.window.lift()
+            return
+        self.atlas_review_window = open_atlas_review(self.root, self.path_var.get().strip('"'), str(self.viewer))
+
     def _run_builder_thread(self, cmd: list[str], path: Path):
         start = time.perf_counter()
+        built_path = path
         try:
             proc = subprocess.Popen(cmd, cwd=str(SCRIPT_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
             assert proc.stdout
             for line in proc.stdout:
+                if line.startswith("[output] "):
+                    built_path = Path(line[len("[output] "):].strip())
                 self.root.after(0, self.log_line, line)
             code = proc.wait()
             debug_log(f"builder_done elapsed={time.perf_counter() - start:.3f}s code={code} path={path}")
             self.root.after(0, self.log_line, f"[exit] builder returned {code}")
-            self.root.after(0, self.scan_root, path)
+            self.root.after(0, self.scan_root, built_path)
         except Exception as exc:
             debug_log(f"builder_error elapsed={time.perf_counter() - start:.3f}s path={path} error={exc} traceback={traceback.format_exc()}")
             self.root.after(0, self.log_line, f"[ERR] builder failed: {exc}")
@@ -1680,6 +1696,7 @@ def main():
     ap = argparse.ArgumentParser(description="GUI candidate picker for Spine Magic Builder staged candidates.")
     ap.add_argument("path", nargs="?", help="Built set folder or scan root.")
     ap.add_argument("--scan-only", action="store_true", help="Print discovered sets/pages as JSON and exit.")
+    ap.add_argument("--atlas-report", help="Open this matching report directly in the Atlas Matches window.")
     args = ap.parse_args()
     start_path = Path(args.path).resolve() if args.path else None
     if args.scan_only:
@@ -1689,6 +1706,9 @@ def main():
 
     root = tk.Tk()
     app = CandidatePickerApp(root, start_path)
+    if args.atlas_report:
+        from spine_atlas_review import AtlasReviewWindow
+        app.atlas_review_window = AtlasReviewWindow(root, Path(args.atlas_report), str(app.viewer))
     root.mainloop()
 
 

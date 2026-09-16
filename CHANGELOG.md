@@ -1,12 +1,16 @@
 # Changelog
 
-## 1.1.2 - 2026-08-28
+## Unreleased - atlas recovery
 
-- Moved GUI folder scanning and candidate thumbnail loading off the Tk event loop to keep the picker responsive on large candidate sets.
-- Added stale-result guards so delayed scans and thumbnail loads cannot overwrite the current selection.
-- Prevented overlapping candidate activation jobs and duplicate automatic SpineViewer launches.
-- Added a rolling GUI debug log for scan, preview, activation, blacklist, and finalize timings.
-- Updated the GUI launcher to prefer `pythonw.exe` before `pyw.exe -3`, matching installs where Pillow is available on the direct Python executable.
+- Replaced one-atlas-only matching with a shared matcher for both builders. Every skeleton is independently evaluated against every atlas in its scan scope; all alternatives remain available without a candidate cap.
+- Added **Atlas Matches** review with background report indexing, evidence details, on-demand pair building and SpineViewer launch. Deferred alternatives are the default; `--atlas-alternatives export` materializes all selected alternatives immediately. Source fingerprints protect against stale audits.
+- Match JSON texture paths instead of bone/slot names; support old/new skin layouts, meshes, linked meshes and sequences. Read Spine 3.8 shared-string tables, validate binary string length prefixes for fallback matching, deduplicate atlas region names, and weight uncommon region evidence.
+- Keep ambiguous binary matches provisional, prefer embedded wrapper atlases, and preserve weak substring candidates for review.
+- Write a complete streaming JSONL audit and offer `--match-report-only`, `--atlas-candidates all`, and `--atlas-candidates best`.
+- Default launchers and the GUI builder now scan the whole selected tree and no longer force unsupported atlas guesses. Explicit child-directory isolation remains available.
+- Isolate output by run, exclude generated output from rescans, sanitize metadata-derived output names, and correct the reversed `--allow-reuse-textures` switch.
+- Fix GUI post-build scanning to open the actual output run and use UTF-8 builder output on Windows.
+- Add matching, export, source-preservation and scale regression tests.
 
 ## 1.1.1 - 2026-08-27
 

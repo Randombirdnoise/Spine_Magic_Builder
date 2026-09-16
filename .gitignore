@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.task-backups/
 venv/
 
 # Local application state and logs

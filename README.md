@@ -42,19 +42,21 @@ The GUI remembers its viewer path and decisions in:
 %LOCALAPPDATA%\SpineMagicBuilder\spine_candidate_picker_state.json
 ```
 
-The GUI also writes a rolling timing/debug log to:
-
-```text
-%LOCALAPPDATA%\SpineMagicBuilder\spine_candidate_picker_debug.log
-```
-
 Set `SPINE_MAGIC_BUILDER_STATE` to use a different state-file location. Set `SPINE_VIEWER_EXE` to define the initial viewer path.
+
+## Atlas matching and alternatives
+
+Both builders now preserve alternative skeleton/atlas pairings instead of committing each skeleton to one guess. Existing launchers scan the whole selected tree, build the first choices, and retain every evaluated atlas in a complete matching report. Use the picker's **Atlas Matches** button to inspect all alternatives and build any pair on demand. Materialized alternatives appear under `_atlas_candidates` inside a separate output folder for each run. A shared atlas can still serve multiple skeletons. Immediate exhaustive export is available with `--atlas-alternatives export`.
+
+For large piles, start with `python spine_magic_builder.py --root "D:\Assets" --match-report-only --top-n 0` to inspect the evidence before exporting potentially many sets. See [the matching guide](MATCHING_GUIDE.md) for ranking details, report fields, limitations and exhaustive recovery options.
 
 ## Included programs
 
 | File | Purpose |
 | --- | --- |
 | `spine_magic_builder.py` | Core recursive scanner and normalized-set builder. |
+| `spine_atlas_matching.py` | Shared atlas ranking, alternative exports and audit reports; required by both builders. |
+| `spine_atlas_review.py` | On-demand atlas comparison window opened by the picker's **Atlas Matches** button. |
 | `spine_magic_builder_candidate_materializer_v3.py` | Extended builder with candidate staging and one-candidate materialization. |
 | `spine_candidate_picker_gui.py` | Tk GUI for reviewing, activating, finalizing, and recording candidate choices. |
 | `Run_SpineMagic_Builder.bat` | Conservative copy-mode builder preset. |
@@ -85,7 +87,7 @@ Candidate activation preserves the previously active page in `_materialized_hist
 
 ### Standard builder
 
-`Run_SpineMagic_Builder.bat` uses copy mode and a moderate atlas-match threshold. Drag a folder onto it or call:
+`Run_SpineMagic_Builder.bat` uses copy mode and preserves all plausible atlas candidates. Drag a folder onto it or call:
 
 ```bat
 Run_SpineMagic_Builder.bat "D:\ExtractedGame\assets"
@@ -93,7 +95,7 @@ Run_SpineMagic_Builder.bat "D:\ExtractedGame\assets"
 
 ### Candidate-stage builder
 
-`Run_SpineMagic_Builder_Candidate_Stage_v3.bat` isolates immediate child folders as entities, ranks ambiguous same-dimension textures, and stages all candidates. It requests symlinks to avoid dupl[...]
+`Run_SpineMagic_Builder_Candidate_Stage_v3.bat` scans the selected tree as one corpus, preserves plausible atlas pairs, and stages ambiguous same-dimension textures with no candidate limit. It requests symlinks with hardlink/copy fallback.
 
 Use `--stage-dim-candidates-limit N` directly from Python when unlimited staging would produce too many candidates.
 

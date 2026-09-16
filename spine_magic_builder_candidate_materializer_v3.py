@@ -2,6 +2,9 @@
 import argparse, re, shutil, struct, json, sys, hashlib, os
 from pathlib import Path
 from typing import Iterator, Optional
+import tempfile
+from spine_atlas_matching import (AtlasMatcher, attachment_paths, add_matching_arguments,
+                                  run_matching_pipeline, safe_name, materialize_from_report)
 
 # -------------------- skeleton JSON trimmer (helpers) --------------------
 _JSON_START_MARKS = [
@@ -63,6 +66,17 @@ def try_extract_skeleton_json_text(txt: str):
 MOVED_MAP = {}
 FILE_HASH_CACHE = {}
 OUTPUT_DEDUPE = {}
+
+def iter_source_files(root):
+    if root.is_file():
+        yield root
+        return
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if not d.lower().startswith("spine_built")
+                         and d not in {"_candidates", "_atlas_candidates", ".git", ".task-backups", "__pycache__"})
+        for name in sorted(files):
+            yield Path(folder) / name
+
 
 # -------------------- tiny utils --------------------
 def read_bytes(p: Path) -> bytes:
@@ -233,60 +247,13 @@ def process_one_root(
     print(f"[info] atlases detected: {len(atlases)}")
 
     print(f"[info] indexing textures…")
-    tex_lut = build_texture_lookup(scan_root)
+    tex_lut = {} if args.match_report_only else build_texture_lookup(scan_root)
 
     print(f"[info] scanning for skeletons…")
     skels = gather_skeletons_by_magic(scan_root)
     print(f"[info] skeleton candidates: {len(skels)}")
 
-    built = 0
-    matched = 0
-
-    for sk in skels:
-        ranked = rank_atlases(sk, atlases)
-        best = choose_best_atlas(sk, atlases, args.min_hits, args.aggressive_atlas)
-
-        if args.top_n > 0 and ranked:
-            print(f"\n[top] {sk.path.name}")
-            for (rh, ph, nb, prox), info in ranked[:args.top_n]:
-                conf = confidence_label(rh, ph, prox)
-                print(f"  - {info['path'].name}  region={rh} page={ph} name_bonus={nb} prox={prox}  conf={conf}")
-
-        if args.explain_match and ranked:
-            _print_ranked_atlas_debug(sk, ranked, max(args.top_n, 5))
-
-        try:
-            export_set(
-                sk, best, tex_lut, out_root,
-                move=args.move,
-                link_mode=args.link_mode,
-                allow_reuse_textures=args.allow_reuse_textures,
-                dims_fallback=args.dims_fallback,
-                prefer_nearby_textures=args.prefer_nearby_textures,
-                prefer_consistent_texture_dir=args.prefer_consistent_texture_dir,
-                rewrite_pages_to_match_source=args.rewrite_pages_to_match_source,
-                explain_match=args.explain_match,
-                dedupe_textures=args.dedupe_textures,
-                stage_dim_candidates=args.stage_dim_candidates,
-                stage_dim_candidates_limit=args.stage_dim_candidates_limit,
-            )
-            built += 1
-
-            if best or (sk.embedded_atlas_text and sk.embedded_atlas_pages):
-                matched += 1
-                if best:
-                    rh, ph, _nb, prox = score_atlas_for_skeleton(sk, best)
-                    conf = confidence_label(rh, ph, prox)
-                    print(f"[OK] {sk.path.name} -> {best['path'].name} (region={rh}, page={ph}, prox={prox}, conf={conf})")
-                else:
-                    print(f"[OK] {sk.path.name} -> (embedded atlas)")
-            else:
-                print(f"[OK] {sk.path.name} -> (no atlas; skeleton normalized)")
-        except Exception as e:
-            print(f"[WARN] failed set for {sk.path.name}: {e}")
-
-    print(f"[done/entity] built: {built}/{len(skels)}   atlas matched/embedded: {matched}/{len(skels)}")
-    return built, matched, len(skels)
+    return run_matching_pipeline(sys.modules[__name__], skels, atlases, tex_lut, out_root, args, source_root=scan_root)
 
 
 
@@ -577,7 +544,7 @@ def parse_atlas_pages_regions(atlas_text: str):
 
 def index_atlases_by_magic(root: Path):
     infos = []
-    for p in root.rglob("*"):
+    for p in iter_source_files(root):
         if not p.is_file(): continue
         txt_head = read_text(p, max_bytes=256*1024)
         if not txt_head: continue
@@ -598,7 +565,7 @@ def build_texture_lookup(root: Path):
     def add(d, k, v):
         if k:
             d.setdefault(k, []).append(v)
-    for p in root.rglob("*"):
+    for p in iter_source_files(root):
         if not p.is_file():
             continue
         w, h = get_image_dims(p)
@@ -632,56 +599,8 @@ class SkelInfo:
         self.embedded_texture_names = None
 
 def extract_json_attachment_tokens(obj) -> set[str]:
-    tokens: set[str] = set()
-    if not isinstance(obj, dict):
-        return tokens
+    return attachment_paths(obj)
 
-    def add_token(n):
-        if isinstance(n, str) and n:
-            tokens.add(n.lower())
-
-    bones = obj.get("bones")
-    if isinstance(bones, list):
-        for b in bones:
-            if isinstance(b, dict):
-                add_token(b.get("name"))
-
-    slots = obj.get("slots")
-    if isinstance(slots, list):
-        for s in slots:
-            if isinstance(s, dict):
-                add_token(s.get("name"))
-                add_token(s.get("attachment"))
-
-    def walk_skin_attachments(attachments):
-        if not isinstance(attachments, dict):
-            return
-        for slot_name, slot_val in attachments.items():
-            add_token(slot_name)
-            if not isinstance(slot_val, dict):
-                continue
-            for attach_name in slot_val.keys():
-                add_token(attach_name)
-
-    skins = obj.get("skins")
-
-    # Spine 3.x often stores skins as a dict keyed by skin name.
-    if isinstance(skins, dict):
-        for _skin_name, skin_val in skins.items():
-            if not isinstance(skin_val, dict):
-                continue
-            walk_skin_attachments(skin_val)
-
-    # Spine 4.x commonly stores skins as a list of objects like:
-    # [{"name": "default", "attachments": {...}}, ...]
-    elif isinstance(skins, list):
-        for skin in skins:
-            if not isinstance(skin, dict):
-                continue
-            add_token(skin.get("name"))
-            walk_skin_attachments(skin.get("attachments"))
-
-    return tokens
 
 def _normalize_skeleton_json_text(raw_txt: str) -> Optional[tuple[str, dict, Optional[str]]]:
     trimmed = try_extract_skeleton_json_text(raw_txt) or raw_txt
@@ -699,11 +618,15 @@ def _normalize_skeleton_json_text(raw_txt: str) -> Optional[tuple[str, dict, Opt
 
 def gather_skeletons_by_magic(root: Path) -> list[SkelInfo]:
     out: list[SkelInfo] = []
-    for p in root.rglob("*"):
+    for p in iter_source_files(root):
         if not p.is_file(): continue
 
         txt_head = read_text(p, max_bytes=2*1024*1024)
         if txt_head and ("{" in txt_head[:64] or '"bones"' in txt_head[:65536]):
+            # Parse complete JSON/wrappers; a truncated 2 MiB prefix can otherwise
+            # misclassify a valid large JSON skeleton as binary via its version.
+            if p.stat().st_size > 2 * 1024 * 1024:
+                txt_head = read_text(p)
 
             if is_cocos_spine_wrapper_text(txt_head):
                 wrapper = try_parse_cocos_wrapper(txt_head)
@@ -902,60 +825,26 @@ def _atlas_name_bonus(sk: SkelInfo, atlas_info: dict) -> int:
     return 0
 
 
-def score_atlas_for_skeleton(sk: SkelInfo, atlas_info: dict) -> tuple[int,int,int,int]:
-    region_hits = 0
-    page_hits = 0
+def score_atlas_for_skeleton(sk: SkelInfo, atlas_info: dict) -> tuple[int, int, int, int]:
+    match = AtlasMatcher([atlas_info], _atlas_name_bonus, path_distance).rank(sk)[0]
+    return len(match.regions), len(match.pages), match.name_bonus, match.proximity
 
-    if sk.kind == "json" and sk.name_tokens:
-        token_set = sk.name_tokens
-        for r in atlas_info.get("regions") or []:
-            if r and r.lower() in token_set:
-                region_hits += 1
-        for pg in atlas_info.get("pages") or []:
-            base = Path(pg["name"]).stem.lower()
-            if base and base in token_set:
-                page_hits += 1
-    else:
-        hay = (sk.bytes.lower() if sk.kind == "binary" else sk.text.encode("utf-8","ignore").lower())
-        for r in atlas_info.get("regions") or []:
-            rb = r.encode("utf-8","ignore").lower()
-            if rb and rb in hay:
-                region_hits += 1
-        for pg in atlas_info.get("pages") or []:
-            base = Path(pg["name"]).stem.lower().encode("ascii", errors="ignore")
-            if base and base in hay:
-                page_hits += 1
-
-    name_bonus = _atlas_name_bonus(sk, atlas_info)
-    dist = path_distance(sk.path.parent, atlas_info["path"].parent)
-    prox = -dist
-    return (region_hits, page_hits, name_bonus, prox)
 
 def confidence_label(region_hits: int, page_hits: int, prox: int) -> str:
-    if region_hits >= 10 or (region_hits >= 4 and page_hits >= 1 and prox >= -6):
-        return "HIGH"
-    if region_hits >= 2 or (page_hits >= 2 and prox >= -6):
-        return "MED"
-    return "LOW"
+    # Counts alone cannot establish correctness, especially for binary names.
+    return "PROVISIONAL" if region_hits or page_hits else "UNSUPPORTED"
 
-def rank_atlases(sk: SkelInfo, atlases: list[dict]) -> list[tuple[tuple[int,int,int], dict]]:
-    scored = []
-    for info in atlases:
-        key = score_atlas_for_skeleton(sk, info)
-        scored.append((key, info))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored
 
-def choose_best_atlas(sk: SkelInfo, atlases: list[dict], min_hits: int, aggressive: bool) -> dict | None:
-    ranked = rank_atlases(sk, atlases)
-    if not ranked:
-        return None
-    (region_hits, page_hits, _name_bonus, prox), best = ranked[0]
-    if aggressive:
-        return best
-    if (region_hits + page_hits) >= min_hits:
-        return best
-    return None
+def rank_atlases(sk: SkelInfo, atlases: list[dict]):
+    return [((len(m.regions), len(m.pages), m.name_bonus, m.proximity), m.atlas)
+            for m in AtlasMatcher(atlases, _atlas_name_bonus, path_distance).rank(sk)]
+
+
+def choose_best_atlas(sk: SkelInfo, atlases: list[dict], min_hits: int, aggressive: bool):
+    ranked = AtlasMatcher(atlases, _atlas_name_bonus, path_distance).rank(sk)
+    eligible = [m for m in ranked if m.hits >= min_hits]
+    return eligible[0].atlas if eligible else (ranked[0].atlas if aggressive and ranked else None)
+
 
 def _candidate_debug_lines(cands, prefer_dir: Path | None, prefer_same_dir: Path | None, atlas_dir: Path | None, page_label: str) -> list[str]:
     if not cands:
@@ -1316,6 +1205,7 @@ def export_set(
     if sk.base_name and sk.base_name.strip():
         base_stem = sk.base_name.strip()
 
+    base_stem = safe_name(base_stem)
     dst_dir = unique_output_dir(out_root, base_stem, sk.path)
 
     # skeleton write
@@ -1337,7 +1227,7 @@ def export_set(
 
     if not atlas_info:
         print(f"    [note] no atlas matched for {sk.path.name}")
-        return
+        return dst_dir
 
     pages = atlas_info["pages"]
     prefer_dir = atlas_info["path"].parent if isinstance(atlas_info.get("path"), Path) else None
@@ -1612,7 +1502,7 @@ def export_set(
         print(f"    textures: {placed}/{len(pages)} placed")
     if stage_dim_candidates and staged_page_specs:
         print(f"    staged candidates: {staged} links/files across {len(staged_page_specs)} page(s) ({len(missed_pages)} unresolved, {len(dim_fallback_pages)} resolved-via-dims)")
-
+    return dst_dir
 
 
 def _find_single_atlas_in_built_set(set_dir: Path) -> Path:
@@ -1716,6 +1606,9 @@ def materialize_candidate_into_built_set(
 
 # -------------------- main --------------------
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description="Scan recursively for Spine assets and build normalized sets.")
     ap.add_argument("--root", help="Root folder to scan (recursively).")
     ap.add_argument("--materialize-built-set", help="Path to one already-built spine set containing a .atlas and a _candidates folder. Used to materialize one candidate page into the set for rapid viewer testing.")
@@ -1729,7 +1622,7 @@ def main():
     ap.add_argument("--min-hits", type=int, default=1, help="Minimum (region+page) hits to accept an atlas match (default: 1).")
     ap.add_argument("--aggressive-atlas", action="store_true", help="Choose best atlas even if hit score is below --min-hits.")
     ap.add_argument("--top-n", type=int, default=1, help="If >0, print top-N atlas candidates per skeleton with scores.")
-    ap.add_argument("--allow-reuse-textures", action="store_false", help="Allow the same texture file to be reused (less conservative).")
+    ap.add_argument("--allow-reuse-textures", action="store_true", help="Allow the same texture file to be reused (less conservative).")
     ap.add_argument("--dims-fallback", action="store_true", help="Allow dimension-only texture selection when names fail (more risk).")
 
     ap.add_argument("--prefer-nearby-textures", action="store_true",
@@ -1752,7 +1645,21 @@ def main():
         default="off",
         help="off = scan --root recursively as one corpus; childdirs = treat each immediate child directory of --root as its own isolated Spine entity root."
     )
+    add_matching_arguments(ap)
     args = ap.parse_args()
+    if args.materialize_atlas_report:
+        if not args.materialize_skeleton or not args.materialize_atlas:
+            ap.error("Atlas materialization requires --materialize-skeleton and --materialize-atlas")
+        dst = materialize_from_report(sys.modules[__name__], args.materialize_atlas_report,
+                                      args.materialize_skeleton, args.materialize_atlas)
+        print(f"[output] {dst}")
+        return
+    if args.min_hits < 1:
+        ap.error("--min-hits must be at least 1; use --aggressive-atlas for unsupported guesses")
+    if args.stage_dim_candidates_limit < 0:
+        ap.error("--stage-dim-candidates-limit must be >= 0")
+    if args.move and not args.match_report_only and args.atlas_candidates != "best":
+        ap.error("--move requires --atlas-candidates best; candidate recovery must preserve shared sources")
 
     if args.materialize_built_set:
         if args.root:
@@ -1772,7 +1679,11 @@ def main():
     if not args.root:
         ap.error('--root is required unless --materialize-built-set is used')
 
+    if not args.root:
+        ap.error("--root is required for scanning")
     root = Path(args.root).resolve()
+    if not root.is_dir():
+        ap.error(f"Source folder does not exist: {root}")
     if args.link_mode != "copy" and args.move:
         print("[warn] --move overrides --link-mode (textures will be moved, not linked).")
     elif args.link_mode != "copy":
@@ -1808,6 +1719,8 @@ def main():
 
     out_root = (container_root / run_folder_name).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
+    out_root = Path(tempfile.mkdtemp(prefix="run-", dir=out_root))
+    print(f"[output] {out_root}", flush=True)
 
     if args.entity_mode == "childdirs":
         entity_roots = find_entity_roots(root)
@@ -1825,7 +1738,7 @@ def main():
                 if not run_folder_name:
                     run_folder_name = "Spine"
 
-                entity_out_root = (container_root / run_folder_name).resolve()
+                entity_out_root = (out_root / (run_folder_name + "__" + stable_short_id(str(ent_root)))).resolve()
                 entity_out_root.mkdir(parents=True, exist_ok=True)
 
                 b, m, t = process_one_root(ent_root, entity_out_root, args)
@@ -1836,63 +1749,8 @@ def main():
             print(f"\n[done] built: {total_built}/{total_skels}   atlas matched/embedded: {total_matched}/{total_skels}")
             return
 
-    print(f"[info] scanning for atlases…")
-    atlases = index_atlases_by_magic(root)
-    print(f"[info] atlases detected: {len(atlases)}")
+    process_one_root(root, out_root, args)
 
-    print(f"[info] indexing textures…")
-    tex_lut = build_texture_lookup(root)
-
-    print(f"[info] scanning for skeletons…")
-    skels = gather_skeletons_by_magic(root)
-    print(f"[info] skeleton candidates: {len(skels)}")
-
-    built = 0
-    matched = 0
-
-    for sk in skels:
-        ranked = rank_atlases(sk, atlases)
-        best = choose_best_atlas(sk, atlases, args.min_hits, args.aggressive_atlas)
-
-        if args.top_n > 0 and ranked:
-            print(f"\n[top] {sk.path.name}")
-            for (rh, ph, nb, prox), info in ranked[:args.top_n]:
-                conf = confidence_label(rh, ph, prox)
-                print(f"  - {info['path'].name}  region={rh} page={ph} name_bonus={nb} prox={prox}  conf={conf}")
-        if args.explain_match and ranked:
-            _print_ranked_atlas_debug(sk, ranked, max(args.top_n, 5))
-
-        try:
-            export_set(
-                sk, best, tex_lut, out_root,
-                move=args.move,
-                link_mode=args.link_mode,
-                allow_reuse_textures=args.allow_reuse_textures,
-                dims_fallback=args.dims_fallback,
-                prefer_nearby_textures=args.prefer_nearby_textures,
-                prefer_consistent_texture_dir=args.prefer_consistent_texture_dir,
-                rewrite_pages_to_match_source=args.rewrite_pages_to_match_source,
-                explain_match=args.explain_match,
-                dedupe_textures=args.dedupe_textures,
-                stage_dim_candidates=args.stage_dim_candidates,
-                stage_dim_candidates_limit=args.stage_dim_candidates_limit,
-            )
-            built += 1
-
-            if best or (sk.embedded_atlas_text and sk.embedded_atlas_pages):
-                matched += 1
-                if best:
-                    rh, ph, _nb, prox = score_atlas_for_skeleton(sk, best)
-                    conf = confidence_label(rh, ph, prox)
-                    print(f"[OK] {sk.path.name} -> {best['path'].name} (region={rh}, page={ph}, prox={prox}, conf={conf})")
-                else:
-                    print(f"[OK] {sk.path.name} -> (embedded atlas)")
-            else:
-                print(f"[OK] {sk.path.name} -> (no atlas; skeleton normalized)")
-        except Exception as e:
-            print(f"[WARN] failed set for {sk.path.name}: {e}")
-
-    print(f"\n[done] built: {built}/{len(skels)}   atlas matched/embedded: {matched}/{len(skels)}")
 
 if __name__ == "__main__":
     main()

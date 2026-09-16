@@ -38,12 +38,12 @@ if not errorlevel 1 (
 "%PYTHON%" %PYTHON_ARGS% "%SCRIPT%" ^
   --root "%TARGET%" ^
   --dims-fallback ^
-  --min-hits 40 ^
+  --min-hits 1 ^
   --prefer-nearby-textures ^
   --prefer-consistent-texture-dir ^
-  --aggressive-atlas ^
+  --atlas-candidates plausible ^
   --rewrite-pages-to-match-source ^
-  --entity-mode childdirs ^
+  --entity-mode off ^
   --link-mode symlink ^
   --stage-dim-candidates ^
   --stage-dim-candidates-limit 0
