@@ -20,11 +20,11 @@ I made this because I kept doing the same detective work by hand. It’s still a
 
 **Candidate 1:**
 
-![Spine Magic Builder candidate picker showing the first candidate beside SpineViewer](docs/candidate-1.png)
+![Spine Magic Builder candidate picker showing the first candidate beside SpineViewer](https://raw.githubusercontent.com/Randombirdnoise/Spine_Magic_Builder/v1.2.0/docs/candidate-1.png)
 
 **Candidate 2:**
 
-![The second candidate activated in the picker and SpineViewer](docs/candidate-2.png)
+![The second candidate activated in the picker and SpineViewer](https://raw.githubusercontent.com/Randombirdnoise/Spine_Magic_Builder/v1.2.0/docs/candidate-2.png)
 
 ## 简体中文
 
@@ -44,8 +44,8 @@ I made this because I kept doing the same detective work by hand. It’s still a
 
 **候选图 1：**
 
-![Spine Magic Builder 候选选择器与 SpineViewer：第一张候选图](docs/candidate-1.png)
+![Spine Magic Builder 候选选择器与 SpineViewer：第一张候选图](https://raw.githubusercontent.com/Randombirdnoise/Spine_Magic_Builder/v1.2.0/docs/candidate-1.png)
 
 **候选图 2：**
 
-![切换到第二张候选图后的选择器与 SpineViewer](docs/candidate-2.png)
+![切换到第二张候选图后的选择器与 SpineViewer](https://raw.githubusercontent.com/Randombirdnoise/Spine_Magic_Builder/v1.2.0/docs/candidate-2.png)
