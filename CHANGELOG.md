@@ -17,6 +17,14 @@
 - Fix GUI post-build scanning to open the actual output run and use UTF-8 builder output on Windows.
 - Add matching, export, source-preservation and scale regression tests.
 
+## 1.1.2 - 2026-08-28
+
+- Moved GUI folder scanning and candidate thumbnail loading off the Tk event loop to keep the picker responsive on large candidate sets.
+- Added stale-result guards so delayed scans and thumbnail loads cannot overwrite the current selection.
+- Prevented overlapping candidate activation jobs and duplicate automatic SpineViewer launches.
+- Added a rolling GUI debug log for scan, preview, activation, blacklist, and finalize timings.
+- Updated the GUI launcher to prefer `pythonw.exe` before `pyw.exe -3`, matching installs where Pillow is available on the direct Python executable.
+
 ## 1.1.1 - 2026-08-27
 
 - Optimized GUI candidate navigation with cached blacklist, used-image, alias, atlas-page, and image-size lookups.
