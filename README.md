@@ -10,6 +10,25 @@ The project is designed for extracted asset trees where filenames and extensions
 
 ## Quick start
 
+### Windows exe
+
+Download `SpineMagicBuilder.exe` from the [latest release](https://github.com/Randombirdnoise/Spine_Magic_Builder/releases/latest) and double-click it. Use **Browse** to choose an extracted asset folder, then **Build Candidates**. You do not need Python or the `.bat` launchers for this edition. The picker can also open an existing built folder containing `_candidates`.
+
+For visual inspection, install [SpineViewer](https://github.com/ww-rm/SpineViewer) separately and choose its `SpineViewer.exe` using **Viewer exe** the first time. The picker remembers that path. Keep both windows visible while reviewing; Left/Right in the picker activates adjacent candidates and returns keyboard focus to the picker after the viewer starts.
+
+The exe does not include SpineViewer or any game assets. If you prefer source scripts, use the instructions below.
+
+#### Build the exe from source
+
+On Windows with Python 3.10+ and PyInstaller installed:
+
+```powershell
+py -3 -m pip install pyinstaller Pillow
+pyinstaller --noconfirm --clean SpineMagicBuilder.spec
+```
+
+The output is `dist\SpineMagicBuilder.exe`. The spec bundles the picker, builder, and atlas review code in one file.
+
 ### Requirements
 
 - Windows 10 or 11
@@ -31,9 +50,9 @@ The core builder uses only the Python standard library. Pillow adds broader imag
 2. Wait for the builder to create a neighboring `Spine_Built-*` directory.
 3. Open `Run_SpineCandidatePicker_GUI.bat`.
 4. Browse to the built directory containing `_candidates` folders.
-5. Select a page and candidate, then press **Activate** or a number key.
+5. Select a set/page and press **Enter** to activate its first candidate. Use **Left/Right** to activate adjacent candidates without returning to the mouse.
 6. Point the GUI to `SpineViewer.exe` when prompted and visually validate the set.
-7. Mark the selection correct, blacklist it, or skip the page.
+7. Press **C** to mark the selection correct, **B** to blacklist it, or **S** to skip the page. Correct/skip advances to the next unresolved page; a blacklist selects the next visible candidate.
 8. Press **Finalize Set** once one set looks right, or **Finalize All** after all loaded sets are ready.
 
 The GUI remembers its viewer path and decisions in:
@@ -124,7 +143,11 @@ Use the **Viewer exe** button if SpineViewer is not found automatically. The aut
 
 Use **Finalize Set** after visual validation to make the selected texture pages final. Finalize uses **Mark Correct** choices first, then falls back to the last activated candidate for pages that were activated but not explicitly marked. **Finalize All** applies the same rules to every loaded set that has at least one selected or activated page, with a confirmation dialog before anything is changed. The default finalize settings move selected page images into the built set and delete `_candidates`. If a staged candidate is a symlink, move mode dereferences it into a real local file so the finished set does not depend on the staged symlink target. Other finalize modes are copy, hardlink, and symlink; disable **Delete _candidates** to keep staged candidates for audit or later adjustment.
 
-Blacklist and used-image entries are stored per page and globally by candidate identity, cleaned staged filename, and trailing long numeric suffix such as `_00001`. Rejecting or accepting the same source image hides it in later folders as you continue reviewing, and candidate counts show the visible total when **Hide blacklisted** is enabled. **Hide blacklisted** is enabled by default and can be unchecked to review hidden candidates. If an image is already marked correct elsewhere, a later blacklist stays local to the current page.
+**Auto-finalize completed set** is optional and disabled by default. Enabling it displays a destructive-action warning; after that, a set finalizes as soon as every page is explicitly marked correct or skipped. Activated-but-unconfirmed candidates are never used by auto-finalize.
+
+Blacklist and used-image entries are stored per page and globally by candidate identity, cleaned staged filename, and trailing long numeric suffix such as `_00001`. Rejecting or accepting the same source image hides it in later folders as you continue reviewing, and candidate counts show the visible total when **Hide blacklisted** is enabled. Use **Blacklist enabled** to suspend all explicit and correct/used-image suppression without deleting its history. Disable **Ask blacklist reason** for a popup-free **B** workflow, and press **H** to toggle hidden candidates. If an image is already marked correct elsewhere, a later blacklist stays local to the current page.
+
+The **Help > Keyboard Shortcuts** menu (or **F1**) lists the complete keyboard map. Number keys activate ranks 1-9, **Ctrl+Left/Right** changes atlas pages, and **F5** launches the viewer.
 
 Use **Preview px** to resize the thumbnail area when a candidate needs closer inspection. The preview size is saved with the other GUI settings.
 
@@ -163,7 +186,7 @@ Run either builder with `--help` for the complete option list. Useful advanced s
 - Default CLI behavior copies source textures; the standard launcher explicitly uses copy mode.
 - The included launchers never pass `--move`.
 - Symlink and hardlink modes save disk space but link generated output to original texture data. Use copy mode if the built set will be edited.
-- `--aggressive-atlas` and `--dims-fallback` improve recovery from damaged naming but can produce false matches. Validate ambiguous results visually.
+- `--aggressive-atlas` can produce false atlas matches. With `--dims-fallback`, exact image dimensions are the primary texture constraint; filenames rank candidates inside that size pool, followed by enabled same-directory/nearby preferences. Validate ambiguous same-dimension results visually.
 - Candidate staging may consume substantial disk space when linking is unavailable. Set a finite candidate limit if needed.
 - Generated state, game assets, candidate folders, and build output are excluded by `.gitignore`.
 

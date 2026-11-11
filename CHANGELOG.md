@@ -1,7 +1,12 @@
 # Changelog
 
-## Unreleased - atlas recovery
+## 1.2.0 - 2026-11-11
 
+- Return keyboard focus to the picker when an automatically launched SpineViewer window takes foreground focus during startup; leave unrelated active windows alone.
+- Support a single-file Windows build whose bundled materializer runs without a Python installation.
+- Added a keyboard-first candidate-review flow: Enter activates, Left/Right activates adjacent candidates, Correct/Skip advances to the next unresolved page, and H toggles hidden candidates.
+- Added blacklist enable/reason controls, explicit correct-image reservation, a guarded auto-finalize-on-completion option, and an in-app shortcuts menu.
+- Changed `--dims-fallback` texture resolution to constrain by exact dimensions first, then rank that pool by filename and optional directory preferences.
 - Replaced one-atlas-only matching with a shared matcher for both builders. Every skeleton is independently evaluated against every atlas in its scan scope; all alternatives remain available without a candidate cap.
 - Added **Atlas Matches** review with background report indexing, evidence details, on-demand pair building and SpineViewer launch. Deferred alternatives are the default; `--atlas-alternatives export` materializes all selected alternatives immediately. Source fingerprints protect against stale audits.
 - Match JSON texture paths instead of bone/slot names; support old/new skin layouts, meshes, linked meshes and sequences. Read Spine 3.8 shared-string tables, validate binary string length prefixes for fallback matching, deduplicate atlas region names, and weight uncommon region evidence.

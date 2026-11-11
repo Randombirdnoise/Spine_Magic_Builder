@@ -1,5 +1,11 @@
 # Spine Magic Builder
 
+## Windows 单文件版
+
+从 [GitHub Releases](https://github.com/Randombirdnoise/Spine_Magic_Builder/releases/latest) 下载 `SpineMagicBuilder.exe`，双击即可打开。点击 **Browse** 选择已提取的资源文件夹，再点击 **Build Candidates**；不需要安装 Python。也可以选择已有的、包含 `_candidates` 的构建结果。
+
+如需在查看器中目视确认，请另外安装 [SpineViewer](https://github.com/ww-rm/SpineViewer)，首次使用时点击 **Viewer exe** 选择它的 `SpineViewer.exe`。左右方向键可在候选图之间切换，查看器启动后键盘焦点会回到候选选择窗口。此 exe 不包含 SpineViewer 或游戏资源。
+
 Spine Magic Builder 是一个以 Windows 为主的重建工具包，用于处理散乱或命名不良的 Spine 资源。它以字节级扫描目录树，识别骨骼（skeleton）和 atlas，匹配纹理页，并将它们重建为规范化的 Spine 集合，便于可视化验证与进一步处理。
 
 本项目面向已提取出的资源目录树，在这些树中文件名和扩展名可能不可信。它支持 JSON 和二进制骨骼发现，支持内嵌或独立的 atlas 数据，以及 PNG/JPEG/WebP 等常见图像格式。

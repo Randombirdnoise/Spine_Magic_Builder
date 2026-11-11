@@ -4,6 +4,9 @@ __pycache__/
 .venv/
 .task-backups/
 venv/
+build/
+dist/
+screenshot_demo/
 
 # Local application state and logs
 spine_candidate_picker_state.json

@@ -900,6 +900,38 @@ def _score_texture_candidate(p: Path, atlas_dir: Path|None):
             score += max(0, 300 - path_distance(p.parent, atlas_dir))
     return score
 
+def _score_texture_name_candidate(
+    p: Path,
+    page_name: str,
+    atlas_stem: str | None = None,
+    name_hints=(),
+):
+    """Rank filenames only after the caller has constrained the pool by dimensions."""
+    candidate_name = p.name.lower()
+    candidate_stem = p.stem.lower()
+    candidate_canonical = _canonical_match_stem(p.stem)
+    hints = []
+    for raw in (page_name, *name_hints):
+        name = Path(str(raw or "")).name.lower()
+        if name and name not in hints:
+            hints.append(name)
+
+    if candidate_name in hints:
+        return 50000, "exact filename"
+    hint_stems = [Path(name).stem for name in hints]
+    if candidate_stem in hint_stems:
+        return 40000, "exact stem"
+    hint_canonical = {_canonical_match_stem(stem) for stem in hint_stems}
+    hint_canonical.discard("")
+    if candidate_canonical and candidate_canonical in hint_canonical:
+        return 30000, "canonical filename"
+
+    atlas_canonical = _canonical_match_stem(atlas_stem or "")
+    if atlas_canonical and candidate_canonical:
+        if candidate_canonical.startswith(atlas_canonical) or atlas_canonical.startswith(candidate_canonical):
+            return 20000, "atlas filename family"
+    return 0, ""
+
 def _pick_best_candidate(
     cands,
     prefer_dir: Path|None,
@@ -907,7 +939,10 @@ def _pick_best_candidate(
     allow_reuse: bool,
     *,
     prefer_nearby: bool = False,
-    prefer_same_dir: Path|None = None
+    prefer_same_dir: Path|None = None,
+    page_name: str = "",
+    atlas_stem: str | None = None,
+    name_hints=(),
 ) -> Path|None:
     if not cands:
         return None
@@ -918,7 +953,7 @@ def _pick_best_candidate(
 
     scored = []
     for p in pool:
-        s = 0
+        s, _name_reason = _score_texture_name_candidate(p, page_name, atlas_stem, name_hints)
         if prefer_same_dir and p.parent == prefer_same_dir:
             s += 2000
         if prefer_nearby:
@@ -1086,7 +1121,14 @@ def _ensure_unique_output_filenames(names: list[str]) -> list[str]:
 
 
 
-def _rank_candidate_pool(cands, prefer_dir: Path | None, prefer_same_dir: Path | None):
+def _rank_candidate_pool(
+    cands,
+    prefer_dir: Path | None,
+    prefer_same_dir: Path | None,
+    page_name: str = "",
+    atlas_stem: str | None = None,
+    name_hints=(),
+):
     seen = set()
     scored = []
     for p in cands or []:
@@ -1094,8 +1136,10 @@ def _rank_candidate_pool(cands, prefer_dir: Path | None, prefer_same_dir: Path |
         if key in seen:
             continue
         seen.add(key)
-        score = 0
+        score, name_reason = _score_texture_name_candidate(p, page_name, atlas_stem, name_hints)
         reasons = []
+        if name_reason:
+            reasons.append(name_reason)
         if prefer_same_dir and p.parent == prefer_same_dir:
             score += 5000
             reasons.append("same chosen texture dir")
@@ -1124,6 +1168,8 @@ def _stage_page_dimension_candidates(
     move: bool,
     link_mode: str,
     limit: int,
+    atlas_stem: str | None = None,
+    name_hints=(),
 ):
     if not want_w or not want_h:
         return 0
@@ -1131,7 +1177,14 @@ def _stage_page_dimension_candidates(
     by_dims = tex_lut["by_dims"]
     pool = by_dims.get((want_w, want_h)) or []
     pool_count = len(pool)
-    ranked = _rank_candidate_pool(pool, prefer_dir, prefer_same_dir)
+    ranked = _rank_candidate_pool(
+        pool,
+        prefer_dir,
+        prefer_same_dir,
+        page_name=page_name,
+        atlas_stem=atlas_stem,
+        name_hints=name_hints,
+    )
     ranked_count = len(ranked)
     if limit and limit > 0:
         ranked = ranked[:limit]
@@ -1249,11 +1302,51 @@ def export_set(
         want_w, want_h = pg.get("size") or (None, None)
         chosen = None
         chosen_reason = None
+        used_dim_fallback = False
 
         prefer_same = chosen_texture_dir if prefer_consistent_texture_dir else None
 
-        # 0) If wrapper has textureNames, try those first
+        # Exact dimensions are the primary evidence. Filename, family, and optional
+        # directory preferences rank candidates only inside that exact-size pool.
+        name_hints = []
         if sk.embedded_texture_names and idx < len(sk.embedded_texture_names):
+            name_hints.append(Path(sk.embedded_texture_names[idx]).name)
+        if rewrite_pages_to_match_source:
+            name_hints.extend(_map_generic_page_to_local_names(page, atlas_stem_for_pages, atlas_page_base, pages))
+        if dims_fallback and want_w and want_h and (want_w, want_h) in by_dims:
+            dims_pool = by_dims[(want_w, want_h)]
+            dims_allow_reuse = allow_reuse_textures if len(pages) == 1 else False
+            if explain_match:
+                debug_notes.append(f"dimension-first pool: {want_w}x{want_h}")
+            chosen = _pick_best_candidate(
+                dims_pool,
+                prefer_dir,
+                used,
+                dims_allow_reuse,
+                prefer_nearby=prefer_nearby_textures,
+                prefer_same_dir=prefer_same,
+                page_name=page,
+                atlas_stem=atlas_stem_for_pages,
+                name_hints=name_hints,
+            )
+            if chosen:
+                chosen_reason = "dims"
+                used_dim_fallback = True
+                if explain_match:
+                    ranked_dims = _rank_candidate_pool(
+                        dims_pool,
+                        prefer_dir,
+                        prefer_same,
+                        page_name=page,
+                        atlas_stem=atlas_stem_for_pages,
+                        name_hints=name_hints,
+                    )
+                    for score, candidate_path, reasons in ranked_dims[:5]:
+                        why = ", ".join(reasons) if reasons else "dimension match"
+                        debug_notes.append(f"dimension candidate score={score}: {candidate_path.name} [{why}]")
+
+        # 1) If no exact-size candidate was available, try wrapper textureNames.
+        if not chosen and sk.embedded_texture_names and idx < len(sk.embedded_texture_names):
             hinted = Path(sk.embedded_texture_names[idx]).name
 
             if hinted.lower() in by_name:
@@ -1377,9 +1470,8 @@ def export_set(
                     if chosen:
                         break
 
-        used_dim_fallback = False
-
-        # 3) Dimension fallback
+        # 3) Dimension fallback (normally handled first; retained for a depleted
+        # no-reuse pool so the remaining name-based recovery paths still work).
         if not chosen and dims_fallback and want_w and want_h and (want_w, want_h) in by_dims:
             if explain_match:
                 debug_notes.append(f"dimension fallback: {want_w}x{want_h}")
@@ -1398,6 +1490,9 @@ def export_set(
                 dims_allow_reuse,
                 prefer_nearby=prefer_nearby_textures,
                 prefer_same_dir=prefer_same,
+                page_name=page,
+                atlas_stem=atlas_stem_for_pages,
+                name_hints=name_hints,
             )
             if chosen:
                 chosen_reason = "dims"
@@ -1494,6 +1589,7 @@ def export_set(
                 move=move,
                 link_mode=link_mode,
                 limit=stage_dim_candidates_limit,
+                atlas_stem=atlas_stem_for_pages,
             )
 
     if dedupe_textures and not move:
@@ -1623,7 +1719,11 @@ def main():
     ap.add_argument("--aggressive-atlas", action="store_true", help="Choose best atlas even if hit score is below --min-hits.")
     ap.add_argument("--top-n", type=int, default=1, help="If >0, print top-N atlas candidates per skeleton with scores.")
     ap.add_argument("--allow-reuse-textures", action="store_true", help="Allow the same texture file to be reused (less conservative).")
-    ap.add_argument("--dims-fallback", action="store_true", help="Allow dimension-only texture selection when names fail (more risk).")
+    ap.add_argument(
+        "--dims-fallback",
+        action="store_true",
+        help="Use exact image dimensions as the primary texture match, then rank that pool by filename and optional directory preferences.",
+    )
 
     ap.add_argument("--prefer-nearby-textures", action="store_true",
         help="Prefer textures closer to the atlas directory when names are ambiguous.")
